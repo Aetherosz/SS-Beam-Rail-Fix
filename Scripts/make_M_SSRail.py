@@ -1,0 +1,118 @@
+# SSBeamRailFix 0.4.0: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
+# Needs the editor's Python Editor Script Plugin enabled in the starter project.
+#
+# A brand-new base material (not a child of the game's MM_FactoryBaked_Spline), so it is compiled
+# and cooked into our own pak. It bends each rail piece on the GPU from the per-instance data the
+# game already writes (in-game logs 2026-11-24):
+#   floats 0-2  primary paint (FICSIT orange 0.953 0.302 0.067), 3-5 secondary
+#   floats 15-17 start position (world), 18-20 start tangent, 21-23 end position, 24-26 end tangent
+#   mesh SM_TrainRail_New runs X 0..1200 (= Length)
+import unreal
+
+MEL = unreal.MaterialEditingLibrary
+EAL = unreal.EditorAssetLibrary
+PKG = '/SSBeamRailFix/Materials'
+NAME = 'M_SSRail'
+PATH = PKG + '/' + NAME
+
+if EAL.does_asset_exist(PATH):
+    EAL.delete_asset(PATH)
+mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
+mat.set_editor_property('used_with_instanced_static_meshes', True)
+
+
+def node(cls, x, y, **props):
+    n = MEL.create_material_expression(mat, cls, x, y)
+    for k, v in props.items():
+        n.set_editor_property(k, v)
+    return n
+
+
+def custom(x, y, code, inputs, out_type):
+    n = node(unreal.MaterialExpressionCustom, x, y)
+    n.set_editor_property('code', code)
+    n.set_editor_property('output_type', out_type)
+    ins = []
+    for name in inputs:
+        ci = unreal.CustomInput()
+        ci.set_editor_property('input_name', name)
+        ins.append(ci)
+    n.set_editor_property('inputs', ins)
+    return n
+
+
+def link(a, a_out, b, b_in):
+    if not MEL.connect_material_expressions(a, a_out, b, b_in):
+        raise RuntimeError('link failed: %s.%s -> %s.%s' % (a.get_name(), a_out, b.get_name(), b_in))
+
+
+def data3(index, x, y):
+    return node(unreal.MaterialExpressionPerInstanceCustomData3Vector, x, y, data_index=index)
+
+
+def scalar(name, value, x, y):
+    return node(unreal.MaterialExpressionScalarParameter, x, y, parameter_name=name, default_value=value)
+
+
+def texture(name, sampler, default, x, y):
+    return node(unreal.MaterialExpressionTextureSampleParameter2D, x, y, parameter_name=name,
+                sampler_type=sampler, texture=unreal.load_asset(default))
+
+
+# ---- bend (World Position Offset) ----
+BEND = '''
+float t = saturate(LP.x / Len);
+float t2 = t * t, t3 = t2 * t;
+float3 P = (2*t3 - 3*t2 + 1) * P0 + (t3 - 2*t2 + t) * T0 + (-2*t3 + 3*t2) * P1 + (t3 - t2) * T1;
+float3 D = (6*t2 - 6*t) * P0 + (3*t2 - 4*t + 1) * T0 + (-6*t2 + 6*t) * P1 + (3*t2 - 2*t) * T1;
+float3 F = normalize(D + float3(1e-4, 0, 0));
+float3 R = normalize(cross(float3(0, 0, 1), F));
+float3 U = cross(F, R);
+return (P + R * LP.y + U * LP.z) - WP;
+'''
+bend = custom(-400, 400, BEND, ['LP', 'WP', 'P0', 'T0', 'P1', 'T1', 'Len'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+link(node(unreal.MaterialExpressionLocalPosition, -900, 300), '', bend, 'LP')
+link(node(unreal.MaterialExpressionWorldPosition, -900, 360,
+          world_position_shader_offset=unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS), '', bend, 'WP')
+link(data3(15, -900, 420), '', bend, 'P0')
+link(data3(18, -900, 480), '', bend, 'T0')
+link(data3(21, -900, 540), '', bend, 'P1')
+link(data3(24, -900, 600), '', bend, 'T1')
+link(scalar('Length', 1200.0, -900, 660), '', bend, 'Len')
+MEL.connect_material_property(bend, '', unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
+
+# ---- colour and paint ----
+# PaintMode picks which part gets painted, because the paint mask inside SS's textures is unknown:
+# 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 the saturated (already coloured) parts of the albedo.
+PAINT = '''
+float3 prim = Prim;
+if (dot(prim, float3(1, 1, 1)) < 0.001) prim = float3(0.953, 0.302, 0.067);
+float lum = dot(Alb, float3(0.299, 0.587, 0.114));
+int mode = (int)round(Mode);
+float m = 1;
+if (mode == 1) m = Masks.r;
+else if (mode == 2) m = Masks.g;
+else if (mode == 3) m = Masks.b;
+else if (mode == 4) m = Masks.a;
+else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min(Alb.g, Alb.b))) * 4);
+return lerp(Alb, prim * saturate(lum * Gain), m);
+'''
+paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+alb = texture('Albedo', unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, '/Engine/EngineResources/DefaultTexture', -900, -300)
+masks = texture('AOMasks', unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, '/Engine/EngineResources/WhiteSquareTexture', -900, -100)
+link(alb, 'RGB', paint, 'Alb')
+link(masks, 'RGBA', paint, 'Masks')
+link(data3(0, -900, 100), '', paint, 'Prim')
+link(scalar('PaintMode', 0.0, -900, 160), '', paint, 'Mode')
+link(scalar('PaintGain', 2.0, -900, 220), '', paint, 'Gain')
+MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
+
+normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
+MEL.connect_material_property(normal, 'RGB', unreal.MaterialProperty.MP_NORMAL)
+MEL.connect_material_property(scalar('Roughness', 0.6, -400, 900), '', unreal.MaterialProperty.MP_ROUGHNESS)
+MEL.connect_material_property(scalar('Metallic', 0.0, -400, 960), '', unreal.MaterialProperty.MP_METALLIC)
+
+MEL.recompile_material(mat)
+EAL.save_asset(PATH)
+unreal.log('SSBeamRailFix: M_SSRail created and saved at ' + PATH)
