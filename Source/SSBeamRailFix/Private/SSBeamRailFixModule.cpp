@@ -18,6 +18,9 @@
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.2: paint only the I-beam body (height mask, PaintMode 6, RailZ), swatch colour with light texture
+ * detail to match the straight I-beams, and logging of every SS rail piece NOT swapped (tone-step check)
+ * plus a per-piece index on paint writes.
  * 0.4.1: 0.4.0 plus logging of every paint write the game makes to a rail piece (PAINTWRITE),
  * to tell "material ignores paint" apart from "paint gun never writes to the rail".
  * 0.4.0
@@ -44,16 +47,16 @@ namespace
 	// 0.4.1: rail piece handles, so we can see whether the paint gun writes new paint to them.
 	TArray<FInstanceOwnerHandlePtr> RailHandles;
 
-	bool IsRailHandle(const FInstanceOwnershipHandle* Self)
+	int32 RailIndex(const FInstanceOwnershipHandle* Self)
 	{
-		for (const FInstanceOwnerHandlePtr& H : RailHandles)
+		for (int32 i = 0; i < RailHandles.Num(); ++i)
 		{
-			if (H.Get() == Self)
+			if (RailHandles[i].Get() == Self)
 			{
-				return true;
+				return i;
 			}
 		}
-		return false;
+		return INDEX_NONE;
 	}
 
 	FString FirstFloats(const TArray<float>& Data, int32 Count)
@@ -68,8 +71,15 @@ namespace
 
 	void ApplyConsoleValues();
 
-	TAutoConsoleVariable<float> CVarPaintMode(TEXT("ssrail.PaintMode"), 0.f,
-		TEXT("SS rail paint area: 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo."),
+	TAutoConsoleVariable<float> CVarRailZ(TEXT("ssrail.RailZ"), 0.f,
+		TEXT("Local height where the steel rail starts (mode 6). Mesh spans -400..135."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarDetail(TEXT("ssrail.PaintDetail"), 0.25f,
+		TEXT("How much texture detail shows through the paint, 0..1."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+
+	TAutoConsoleVariable<float> CVarPaintMode(TEXT("ssrail.PaintMode"), 6.f,
+		TEXT("SS rail paint area: 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo, 6 below RailZ (I-beam body)."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarPaintGain(TEXT("ssrail.PaintGain"), 2.f,
 		TEXT("SS rail paint brightness."),
@@ -81,7 +91,10 @@ namespace
 		{
 			MID->SetScalarParameterValue(TEXT("PaintMode"), CVarPaintMode.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("PaintGain"), CVarPaintGain.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f"), CVarPaintMode.GetValueOnGameThread(), CVarPaintGain.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("RailZ"), CVarRailZ.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f"), CVarPaintMode.GetValueOnGameThread(),
+				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread());
 		}
 	}
 
@@ -156,7 +169,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.1 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.2 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -181,6 +194,15 @@ void FSSBeamRailFixModule::StartupModule()
 				{
 					Current = Data.StaticMesh->GetMaterial(Slot);
 				}
+				if (Current != BrokenMaterial && Current != MID)
+				{
+					static int32 NotSwapped = 0;
+					if (NotSwapped++ < 20)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("NOTSWAPPED %s mesh=%s slot %d mat=%s"), *Owner->GetName(),
+							*Data.StaticMesh->GetPathName(), Slot, *GetPathNameSafe(Current));
+					}
+				}
 				if (Current == BrokenMaterial)
 				{
 					if (Data.OverridenMaterials.Num() < Slots)
@@ -188,7 +210,7 @@ void FSSBeamRailFixModule::StartupModule()
 						Data.OverridenMaterials.SetNum(Slots);
 					}
 					Data.OverridenMaterials[Slot] = MID;
-					if (Swapped++ < 3)
+					if (Swapped++ < 3 || Swapped % 50 == 0)
 					{
 						UE_LOG(LogSSBeamRailFix, Display, TEXT("Swapped MI_Tack_SS on %s of %s, slot %d."),
 							*Data.StaticMesh->GetName(), *Owner->GetClass()->GetName(), Slot);
@@ -217,10 +239,11 @@ void FSSBeamRailFixModule::StartupModule()
 		[](const FInstanceOwnershipHandle* Self, const TArray<float>& Data, bool)
 		{
 			static int32 Logged = 0;
-			if (Logged < 60 && IsRailHandle(Self))
+			const int32 Index = Logged < 120 ? RailIndex(Self) : INDEX_NONE;
+			if (Index != INDEX_NONE)
 			{
 				++Logged;
-				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece: [%s]"), *FirstFloats(Data, 15));
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, 6));
 			}
 		});
 
@@ -228,10 +251,11 @@ void FSSBeamRailFixModule::StartupModule()
 		[](const FInstanceOwnershipHandle* Self, float Value, const int32 Index, bool)
 		{
 			static int32 Logged = 0;
-			if (Logged < 60 && IsRailHandle(Self))
+			const int32 Piece = Logged < 60 ? RailIndex(Self) : INDEX_NONE;
+			if (Piece != INDEX_NONE)
 			{
 				++Logged;
-				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece: %d = %f"), Index, Value);
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece %d: %d = %f"), Piece, Index, Value);
 			}
 		});
 

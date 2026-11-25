@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.0: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.2: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -83,8 +83,11 @@ link(scalar('Length', 1200.0, -900, 660), '', bend, 'Len')
 MEL.connect_material_property(bend, '', unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
 
 # ---- colour and paint ----
-# PaintMode picks which part gets painted, because the paint mask inside SS's textures is unknown:
-# 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 the saturated (already coloured) parts of the albedo.
+# PaintMode picks which part gets painted:
+# 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo,
+# 6 (default, 0.4.2) everything below local height RailZ: the I-beam body. The mesh spans Z -400..135,
+#   so the beam is presumed to be -400..0 and the steel rail on top 0..135. RailZ/RailBlend are tunable live.
+# Painted colour = swatch colour with light texture detail (Detail), so it matches the straight I-beams.
 PAINT = '''
 float3 prim = Prim;
 if (dot(prim, float3(1, 1, 1)) < 0.001) prim = float3(0.953, 0.302, 0.067);
@@ -96,16 +99,22 @@ else if (mode == 2) m = Masks.g;
 else if (mode == 3) m = Masks.b;
 else if (mode == 4) m = Masks.a;
 else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min(Alb.g, Alb.b))) * 4);
-return lerp(Alb, prim * saturate(lum * Gain), m);
+else if (mode == 6) m = 1 - saturate((LP.z - RailZ) / max(RailBlend, 0.01) + 0.5);
+float3 painted = prim * lerp(1, saturate(lum * Gain), Detail);
+return lerp(Alb, painted, m);
 '''
-paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
 alb = texture('Albedo', unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, '/Engine/EngineResources/DefaultTexture', -900, -300)
 masks = texture('AOMasks', unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, '/Engine/EngineResources/WhiteSquareTexture', -900, -100)
 link(alb, 'RGB', paint, 'Alb')
 link(masks, 'RGBA', paint, 'Masks')
 link(data3(0, -900, 100), '', paint, 'Prim')
-link(scalar('PaintMode', 0.0, -900, 160), '', paint, 'Mode')
+link(scalar('PaintMode', 6.0, -900, 160), '', paint, 'Mode')
 link(scalar('PaintGain', 2.0, -900, 220), '', paint, 'Gain')
+link(scalar('PaintDetail', 0.25, -900, 280), '', paint, 'Detail')
+link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', paint, 'LP')
+link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
+link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
 
 normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
