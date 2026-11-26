@@ -18,6 +18,8 @@
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.4: unpainted steel rail darkened and desaturated to match the game's track steel
+ * (ssrail.RailBright, ssrail.RailSat).
  * 0.4.3: paint mask uses the pre-bend local position (vertex interpolator), so the steel rail stays
  * unpainted on curved pieces too. ssrail.PaintMode 7 shows the beam/rail split (red/green).
  * 0.4.2: paint only the I-beam body (height mask, PaintMode 6, RailZ), swatch colour with light texture
@@ -76,6 +78,12 @@ namespace
 	TAutoConsoleVariable<float> CVarRailZ(TEXT("ssrail.RailZ"), 0.f,
 		TEXT("Local height where the steel rail starts (mode 6). Mesh spans -400..135."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarRailBright(TEXT("ssrail.RailBright"), 0.45f,
+		TEXT("Brightness of the unpainted steel rail, 0..1."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarRailSat(TEXT("ssrail.RailSat"), 0.3f,
+		TEXT("Colour saturation of the unpainted steel rail, 0..1."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarDetail(TEXT("ssrail.PaintDetail"), 0.25f,
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -95,8 +103,11 @@ namespace
 			MID->SetScalarParameterValue(TEXT("PaintGain"), CVarPaintGain.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailZ"), CVarRailZ.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f"), CVarPaintMode.GetValueOnGameThread(),
-				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f"), CVarPaintMode.GetValueOnGameThread(),
+				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
+				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread());
 		}
 	}
 
@@ -171,7 +182,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.3 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.4 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,

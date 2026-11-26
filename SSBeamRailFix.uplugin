@@ -1,8 +1,8 @@
 ﻿{
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.4.3",
-	"SemVersion": "0.4.3",
+	"VersionName": "0.4.4",
+	"SemVersion": "0.4.4",
 	"GameVersion": ">=520140",
 	"FriendlyName": "SS Beam Rail Fix (private test)",
 	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",

@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.3: writes source, uplugin and the UPDATED material script. Stops if the Unreal Editor is running.
+# SSBeamRailFix 0.4.4: writes source, uplugin and the UPDATED material script. Stops if the Unreal Editor is running.
 # Then: 1) rerun the material script (M_SSRail changed: beam-only paint mask, new params):
 #          UnrealEditor-Cmd.exe "<starter FactoryGame.uproject>" -run=pythonscript -script="$mod\Scripts\make_M_SSRail.py"
 #          success line "M_SSRail created and saved" is in SML\Saved\Logs\FactoryGame.log
@@ -11,8 +11,8 @@ New-Item -ItemType Directory -Force "$mod\Scripts","$mod\Content\Materials" | Ou
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.4.3",
-	"SemVersion": "0.4.3",
+	"VersionName": "0.4.4",
+	"SemVersion": "0.4.4",
 	"GameVersion": ">=520140",
 	"FriendlyName": "SS Beam Rail Fix (private test)",
 	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",
@@ -66,6 +66,8 @@ New-Item -ItemType Directory -Force "$mod\Scripts","$mod\Content\Materials" | Ou
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.4: unpainted steel rail darkened and desaturated to match the game's track steel
+ * (ssrail.RailBright, ssrail.RailSat).
  * 0.4.3: paint mask uses the pre-bend local position (vertex interpolator), so the steel rail stays
  * unpainted on curved pieces too. ssrail.PaintMode 7 shows the beam/rail split (red/green).
  * 0.4.2: paint only the I-beam body (height mask, PaintMode 6, RailZ), swatch colour with light texture
@@ -124,6 +126,12 @@ namespace
 	TAutoConsoleVariable<float> CVarRailZ(TEXT("ssrail.RailZ"), 0.f,
 		TEXT("Local height where the steel rail starts (mode 6). Mesh spans -400..135."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarRailBright(TEXT("ssrail.RailBright"), 0.45f,
+		TEXT("Brightness of the unpainted steel rail, 0..1."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarRailSat(TEXT("ssrail.RailSat"), 0.3f,
+		TEXT("Colour saturation of the unpainted steel rail, 0..1."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarDetail(TEXT("ssrail.PaintDetail"), 0.25f,
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -143,8 +151,11 @@ namespace
 			MID->SetScalarParameterValue(TEXT("PaintGain"), CVarPaintGain.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailZ"), CVarRailZ.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f"), CVarPaintMode.GetValueOnGameThread(),
-				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f"), CVarPaintMode.GetValueOnGameThread(),
+				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
+				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread());
 		}
 	}
 
@@ -219,7 +230,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.3 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.4 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -339,7 +350,7 @@ void FSSBeamRailFixModule::StartupModule()
 IMPLEMENT_MODULE(FSSBeamRailFixModule, SSBeamRailFix)
 '@ | Set-Content -Encoding UTF8 "$mod\Source\SSBeamRailFix\Private\SSBeamRailFixModule.cpp"
 @'
-# SSBeamRailFix 0.4.3: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.4: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -357,9 +368,10 @@ PKG = '/SSBeamRailFix/Materials'
 NAME = 'M_SSRail'
 PATH = PKG + '/' + NAME
 
-# Reuse the existing asset: delete-and-recreate fails unattended in the commandlet (0.4.2 lesson).
-if EAL.does_asset_exist(PATH):
-    mat = unreal.load_asset(PATH)
+# Reuse the existing asset. In the commandlet does_asset_exist is False until the registry scans the
+# plugin, and delete-and-recreate fails unattended, so load first and create only if that fails.
+mat = unreal.load_asset(PATH)
+if mat is not None:
     MEL.delete_all_material_expressions(mat)
 else:
     mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
@@ -449,9 +461,10 @@ else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min
 else if (mode == 6) m = 1 - saturate((LP.z - RailZ) / max(RailBlend, 0.01) + 0.5);
 else if (mode == 7) return lerp(float3(1, 0, 0), float3(0, 1, 0), step(RailZ, LP.z)) * (0.6 + 0.4 * frac(LP.z / 50));
 float3 painted = prim * lerp(1, saturate(lum * Gain), Detail);
-return lerp(Alb, painted, m);
+float3 steel = lerp(lum.xxx, Alb, RailSat) * RailBright;
+return lerp(steel, painted, m);
 '''
-paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend', 'RailBright', 'RailSat'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
 alb = texture('Albedo', unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, '/Engine/EngineResources/DefaultTexture', -900, -300)
 masks = texture('AOMasks', unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, '/Engine/EngineResources/WhiteSquareTexture', -900, -100)
 link(alb, 'RGB', paint, 'Alb')
@@ -468,6 +481,10 @@ link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
 link(vi, '', paint, 'LP')
 link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
 link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
+# 0.4.4: the unpainted steel rail showed SS's raw albedo, lighter and warmer than the game's dark steel
+# track. Darken and desaturate it; both are tunable live (ssrail.RailBright, ssrail.RailSat).
+link(scalar('RailBright', 0.45, -900, 520), '', paint, 'RailBright')
+link(scalar('RailSat', 0.3, -900, 580), '', paint, 'RailSat')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
 
 normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
@@ -479,4 +496,4 @@ MEL.recompile_material(mat)
 EAL.save_asset(PATH)
 unreal.log('SSBeamRailFix: M_SSRail created and saved at ' + PATH)
 '@ | Set-Content -Encoding UTF8 "$mod\Scripts\make_M_SSRail.py"
-Write-Host 'Source is 0.4.3. Run make_M_SSRail.py in the editor commandlet (it now updates M_SSRail in place), then PackagePlugin (-DLCName=SSBeamRailFix).'
+Write-Host 'Source is 0.4.4. Run make_M_SSRail.py in the editor commandlet (loads and updates M_SSRail in place; no need to move it aside), then PackagePlugin (-DLCName=SSBeamRailFix).'

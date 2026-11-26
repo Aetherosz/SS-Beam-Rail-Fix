@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.3: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.4: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -16,9 +16,10 @@ PKG = '/SSBeamRailFix/Materials'
 NAME = 'M_SSRail'
 PATH = PKG + '/' + NAME
 
-# Reuse the existing asset: delete-and-recreate fails unattended in the commandlet (0.4.2 lesson).
-if EAL.does_asset_exist(PATH):
-    mat = unreal.load_asset(PATH)
+# Reuse the existing asset. In the commandlet does_asset_exist is False until the registry scans the
+# plugin, and delete-and-recreate fails unattended, so load first and create only if that fails.
+mat = unreal.load_asset(PATH)
+if mat is not None:
     MEL.delete_all_material_expressions(mat)
 else:
     mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
@@ -108,9 +109,10 @@ else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min
 else if (mode == 6) m = 1 - saturate((LP.z - RailZ) / max(RailBlend, 0.01) + 0.5);
 else if (mode == 7) return lerp(float3(1, 0, 0), float3(0, 1, 0), step(RailZ, LP.z)) * (0.6 + 0.4 * frac(LP.z / 50));
 float3 painted = prim * lerp(1, saturate(lum * Gain), Detail);
-return lerp(Alb, painted, m);
+float3 steel = lerp(lum.xxx, Alb, RailSat) * RailBright;
+return lerp(steel, painted, m);
 '''
-paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend', 'RailBright', 'RailSat'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
 alb = texture('Albedo', unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, '/Engine/EngineResources/DefaultTexture', -900, -300)
 masks = texture('AOMasks', unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, '/Engine/EngineResources/WhiteSquareTexture', -900, -100)
 link(alb, 'RGB', paint, 'Alb')
@@ -127,6 +129,10 @@ link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
 link(vi, '', paint, 'LP')
 link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
 link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
+# 0.4.4: the unpainted steel rail showed SS's raw albedo, lighter and warmer than the game's dark steel
+# track. Darken and desaturate it; both are tunable live (ssrail.RailBright, ssrail.RailSat).
+link(scalar('RailBright', 0.45, -900, 520), '', paint, 'RailBright')
+link(scalar('RailSat', 0.3, -900, 580), '', paint, 'RailSat')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
 
 normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
