@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.6: writes source and uplugin only. M_SSRail is unchanged from 0.4.5, so NO editor step.
+# SSBeamRailFix 0.4.7: writes source and uplugin only. M_SSRail is unchanged from 0.4.5, so NO editor step.
 # Then the usual PackagePlugin -DLCName=SSBeamRailFix.
 param([string]$mod = (Split-Path -Parent $PSScriptRoot))  # the mod folder (repo root); pass -mod to write elsewhere
 $ErrorActionPreference = 'Stop'
@@ -8,8 +8,8 @@ if (-not (Test-Path "$mod\Content\Materials\M_SSRail.uasset")) { throw 'M_SSRail
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.4.6",
-	"SemVersion": "0.4.6",
+	"VersionName": "0.4.7",
+	"SemVersion": "0.4.7",
 	"GameVersion": ">=520140",
 	"FriendlyName": "SS Beam Rail Fix (private test)",
 	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",
@@ -64,6 +64,10 @@ if (-not (Test-Path "$mod\Content\Materials\M_SSRail.uasset")) { throw 'M_SSRail
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.7: construction animation. While an SS rail is being built, the game draws each piece as a plain
+ * StaticMeshComponent (SM_TrainRail_New, Factory_Materialize MID, no instance data), so it shows straight,
+ * unbent chunks. Each such component is hidden and replaced by a SplineMeshComponent with the same mesh and
+ * the same materialize MID, bent with that piece's own spline data. Ours is destroyed when the game's goes.
  * 0.4.6: hologram. SS's Holo_RailRoadTrack_Custom draws SM_TrainRail_New on a StaticMeshComponent plus
  * SplineMeshComponents with the broken MI_Tack_SS. While an SS rail hologram exists, its MI_Tack_SS slots
  * are switched to the game's own MI_Tack_01 (what the vanilla track hologram uses on its spline meshes).
@@ -118,6 +122,20 @@ namespace
 	};
 	TMap<TWeakObjectPtr<AActor>, TArray<FOverlay>> Overlays;
 	bool bAddingOverlay = false;
+
+	// 0.4.7: per-piece spline data (world space, from instance floats 15-26) for the construction animation.
+	struct FRailSpline
+	{
+		FVector P0, T0, P1, T1;
+	};
+	TMap<TWeakObjectPtr<AActor>, TArray<FRailSpline>> RailSplines;
+	struct FBuildSwap
+	{
+		TWeakObjectPtr<UStaticMeshComponent> Original;
+		TWeakObjectPtr<USplineMeshComponent> Bent;
+	};
+	TArray<FBuildSwap> BuildSwaps;
+	int32 BuildSwapsLogged = 0;
 	int32 OverlaysAdded = 0;
 
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
@@ -238,6 +256,83 @@ namespace
 		}
 	}
 
+	/** Replace the game's straight construction meshes on SS rails with bent spline meshes. */
+	void FixConstruction()
+	{
+		static UStaticMesh* RailMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/SS_Mod/Mesh/Steel/SM_TrainRail_New.SM_TrainRail_New"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+		// Clean up ours once the game's component is gone.
+		for (int32 i = BuildSwaps.Num() - 1; i >= 0; --i)
+		{
+			UStaticMeshComponent* O = BuildSwaps[i].Original.Get();
+			if (!O || !O->IsRegistered() || O->IsBeingDestroyed())
+			{
+				if (USplineMeshComponent* B = BuildSwaps[i].Bent.Get())
+				{
+					B->DestroyComponent();
+				}
+				BuildSwaps.RemoveAtSwap(i);
+			}
+		}
+		if (!RailMesh)
+		{
+			return;
+		}
+		for (auto& Pair : RailSplines)
+		{
+			AActor* A = Pair.Key.Get();
+			if (!A || Pair.Value.Num() == 0)
+			{
+				continue;
+			}
+			TInlineComponentArray<UStaticMeshComponent*> Comps(A);
+			for (UStaticMeshComponent* C : Comps)
+			{
+				if (Cast<USplineMeshComponent>(C) || C->GetStaticMesh() != RailMesh || !C->IsVisible())
+				{
+					continue;
+				}
+				// The piece whose start is nearest this component.
+				const FVector Loc = C->GetComponentLocation();
+				const FRailSpline* Best = nullptr;
+				double BestDist = TNumericLimits<double>::Max();
+				for (const FRailSpline& RS : Pair.Value)
+				{
+					const double Dist = FVector::DistSquared(Loc, RS.P0);
+					if (Dist < BestDist)
+					{
+						BestDist = Dist;
+						Best = &RS;
+					}
+				}
+				if (!Best)
+				{
+					continue;
+				}
+				const FTransform T = C->GetComponentTransform();
+				USplineMeshComponent* B = NewObject<USplineMeshComponent>(A);
+				B->SetMobility(EComponentMobility::Movable);
+				B->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+				B->SetStaticMesh(RailMesh);
+				B->SetupAttachment(A->GetRootComponent());
+				B->RegisterComponent();
+				B->SetWorldTransform(T);
+				B->SetStartAndEnd(T.InverseTransformPosition(Best->P0), T.InverseTransformVector(Best->T0),
+					T.InverseTransformPosition(Best->P1), T.InverseTransformVector(Best->T1), true);
+				for (int32 Slot = 0; Slot < C->GetNumMaterials(); ++Slot)
+				{
+					B->SetMaterial(Slot, C->GetMaterial(Slot));
+				}
+				C->SetVisibility(false);
+				BuildSwaps.Add({C, B});
+				if (BuildSwapsLogged++ < 6)
+				{
+					UE_LOG(LogSSBeamRailFix, Display, TEXT("BUILDSWAP %s.%s -> bent spline mesh (start offset %.0f, mat %s)"), *A->GetName(), *C->GetName(),
+						FMath::Sqrt(BestDist), *GetNameSafe(C->GetMaterial(0)));
+				}
+			}
+		}
+	}
+
 	void StartHighlightProbe(UWorld* World)
 	{
 		if (bProbeStarted || !World)
@@ -245,6 +340,8 @@ namespace
 			return;
 		}
 		bProbeStarted = true;
+		FTimerHandle FastHandle;
+		World->GetTimerManager().SetTimer(FastHandle, FTimerDelegate::CreateLambda([]() { FixConstruction(); }), 0.05f, true);
 		FTimerHandle Handle;
 		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
 		{
@@ -372,7 +469,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.6 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.7 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -436,6 +533,17 @@ void FSSBeamRailFixModule::StartupModule()
 				return;
 			}
 			RailHandles.Add(Handle);
+			{
+				const TArray<float>& F = Instance.DefaultPerInstanceCustomData;
+				if (F.Num() >= 27)
+				{
+					FRailSpline& RS = RailSplines.FindOrAdd(Owner).AddDefaulted_GetRef();
+					RS.P0 = FVector(F[15], F[16], F[17]);
+					RS.T0 = FVector(F[18], F[19], F[20]);
+					RS.P1 = FVector(F[21], F[22], F[23]);
+					RS.T1 = FVector(F[24], F[25], F[26]);
+				}
+			}
 			if (!bAddingOverlay && Manager)
 			{
 				static UStaticMesh* VanillaMesh = LoadObject<UStaticMesh>(nullptr, VanillaMeshPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
@@ -495,6 +603,10 @@ void FSSBeamRailFixModule::StartupModule()
 		[](auto& Scope, AFGBuildable* Self, const EEndPlayReason::Type Reason)
 		{
 			TArray<FOverlay> List;
+			if (Self)
+			{
+				RailSplines.Remove(Self);
+			}
 			if (!Self || !Overlays.RemoveAndCopyValue(Self, List))
 			{
 				return;
@@ -563,4 +675,4 @@ void FSSBeamRailFixModule::StartupModule()
 
 IMPLEMENT_MODULE(FSSBeamRailFixModule, SSBeamRailFix)
 '@ | Set-Content -Encoding UTF8 "$mod\Source\SSBeamRailFix\Private\SSBeamRailFixModule.cpp"
-Write-Host 'Source is 0.4.6. Package with PackagePlugin (-DLCName=SSBeamRailFix).'
+Write-Host 'Source is 0.4.7. Package with PackagePlugin (-DLCName=SSBeamRailFix).'
