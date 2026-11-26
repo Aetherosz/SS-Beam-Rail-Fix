@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.2: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.3: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -16,9 +16,14 @@ PKG = '/SSBeamRailFix/Materials'
 NAME = 'M_SSRail'
 PATH = PKG + '/' + NAME
 
+# Reuse the existing asset: delete-and-recreate fails unattended in the commandlet (0.4.2 lesson).
 if EAL.does_asset_exist(PATH):
-    EAL.delete_asset(PATH)
-mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
+    mat = unreal.load_asset(PATH)
+    MEL.delete_all_material_expressions(mat)
+else:
+    mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
+if mat is None:
+    raise RuntimeError('M_SSRail could not be loaded or created')
 mat.set_editor_property('used_with_instanced_static_meshes', True)
 
 
@@ -85,6 +90,7 @@ MEL.connect_material_property(bend, '', unreal.MaterialProperty.MP_WORLD_POSITIO
 # ---- colour and paint ----
 # PaintMode picks which part gets painted:
 # 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo,
+# 7 debug: red below RailZ, green above, banded every 50 units of local height.
 # 6 (default, 0.4.2) everything below local height RailZ: the I-beam body. The mesh spans Z -400..135,
 #   so the beam is presumed to be -400..0 and the steel rail on top 0..135. RailZ/RailBlend are tunable live.
 # Painted colour = swatch colour with light texture detail (Detail), so it matches the straight I-beams.
@@ -100,6 +106,7 @@ else if (mode == 3) m = Masks.b;
 else if (mode == 4) m = Masks.a;
 else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min(Alb.g, Alb.b))) * 4);
 else if (mode == 6) m = 1 - saturate((LP.z - RailZ) / max(RailBlend, 0.01) + 0.5);
+else if (mode == 7) return lerp(float3(1, 0, 0), float3(0, 1, 0), step(RailZ, LP.z)) * (0.6 + 0.4 * frac(LP.z / 50));
 float3 painted = prim * lerp(1, saturate(lum * Gain), Detail);
 return lerp(Alb, painted, m);
 '''
@@ -112,7 +119,12 @@ link(data3(0, -900, 100), '', paint, 'Prim')
 link(scalar('PaintMode', 6.0, -900, 160), '', paint, 'Mode')
 link(scalar('PaintGain', 2.0, -900, 220), '', paint, 'Gain')
 link(scalar('PaintDetail', 0.25, -900, 280), '', paint, 'Detail')
-link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', paint, 'LP')
+# 0.4.3: take the mesh's own local position in the vertex shader, before the bend, and carry it to the
+# pixel shader. In 0.4.2 the pixel-shader LocalPosition was rebuilt from the bent position, so on curved
+# pieces the beam/rail split moved and the steel rail took paint.
+vi = node(unreal.MaterialExpressionVertexInterpolator, -700, 340)
+link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
+link(vi, '', paint, 'LP')
 link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
 link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
