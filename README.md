@@ -8,7 +8,7 @@ This mod draws the rail with its own material, `M_SSRail`, instead. The material
 - bends each rail piece along the track's curve on the GPU, using the spline data the game already provides
 - takes the normal paint colour, like other buildables
 
-On top of each beam piece, the mod also places the game's own track piece (its mesh and material, loaded from the game at runtime). That way the steel rail and deck look exactly like vanilla track. These extra pieces follow their beam piece exactly: they're hidden, shown and updated whenever the game hides, shows or updates the beam piece (for example during the build animation), and they're removed when the beam piece is dismantled.
+On top of each beam piece, the mod also places the game's own track piece (its mesh and material, loaded from the game at runtime). That way the steel rail and deck look exactly like vanilla track. These extra pieces follow their beam piece exactly: they start hidden or shown like the beam piece, appear when it does, and take the same per-piece data updates (for example during the build animation). They're removed when the beam piece is dismantled. When you point the dismantle tool at beam railway, the highlight is bent along the curve too.
 
 While you place beam railway, its build hologram uses the game's own track material instead of SS's broken one, so the preview isn't grey either.
 
@@ -36,6 +36,7 @@ Credit for the rail model, textures and the railway itself goes to D4rk.
 | `ssrail.RailSat` | `0.3` | Colour saturation of the unpainted steel rail, from `0` to `1`. |
 | `ssrail.ClipRail` | `1` | `1` hides the rail part of `M_SSRail` and shows the game's own track on top, so the steel rail and deck look exactly like vanilla track. `0` shows the mod's own rail instead, for comparison. |
 | `ssrail.PaintGain` | `2` | Brightness of the paint colour. |
+| `ssrail.BendHighlight` | `1` | `1` bends the dismantle highlight along the rail's curve. `0` leaves the game's straight highlight pieces. |
 | `ssrail.PaintDetail` | `0.25` | How much of the texture detail shows through the paint, from `0` (flat colour) to `1`. |
 
 Changes apply immediately to rail that's already built.
@@ -47,4 +48,4 @@ The repo root is the plugin folder. Put it in an SML starter project under `Mods
 1. **Only if the material changes:** close the Unreal Editor and rebuild it with `Scripts/make_M_SSRail.py`. Run it through the editor's Python commandlet: `UnrealEditor-Cmd.exe <FactoryGame.uproject> -run=pythonscript -script=<path to make_M_SSRail.py>`. It needs the Python Editor Script Plugin. If `M_SSRail` already exists, the script loads it and rebuilds its graph in place, so there's no need to move the old one aside.
 2. Package with Alpakit, or with `RunUAT PackagePlugin -DLCName=SSBeamRailFix`.
 
-`tools/rebuild-0.4.8.ps1` writes the current `.uplugin` and C++ source into the mod folder (the material hasn't changed since 0.4.5). By default that's the repo root; use `-mod <path>` to point it elsewhere.
+`tools/rebuild-0.4.9.ps1` writes the current `.uplugin` and C++ source into the mod folder (the material hasn't changed since 0.4.5). By default that's the repo root; use `-mod <path>` to point it elsewhere.
