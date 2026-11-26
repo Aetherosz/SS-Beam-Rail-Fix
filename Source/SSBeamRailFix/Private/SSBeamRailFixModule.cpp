@@ -19,7 +19,11 @@
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
- * 0.4.7: construction animation. While an SS rail is being built, the game draws each piece as a plain
+ * 0.4.8: the added vanilla track instance now mirrors its SS piece exactly: same initial hidden state,
+ * every hide/unhide, and every per-instance data write the game makes to the SS piece (construction and
+ * paint state). Without that, it showed the wrong state during the construction effect, which D4rk's
+ * original never did. 0.4.7's construction-mesh swap is removed: those meshes were the dismantle highlight.
+ * 0.4.7 (removed): construction animation. While an SS rail is being built, the game draws each piece as a plain
  * StaticMeshComponent (SM_TrainRail_New, Factory_Materialize MID, no instance data), so it shows straight,
  * unbent chunks. Each such component is hidden and replaced by a SplineMeshComponent with the same mesh and
  * the same materialize MID, bent with that piece's own spline data. Ours is destroyed when the game's goes.
@@ -78,19 +82,11 @@ namespace
 	TMap<TWeakObjectPtr<AActor>, TArray<FOverlay>> Overlays;
 	bool bAddingOverlay = false;
 
-	// 0.4.7: per-piece spline data (world space, from instance floats 15-26) for the construction animation.
-	struct FRailSpline
-	{
-		FVector P0, T0, P1, T1;
-	};
-	TMap<TWeakObjectPtr<AActor>, TArray<FRailSpline>> RailSplines;
-	struct FBuildSwap
-	{
-		TWeakObjectPtr<UStaticMeshComponent> Original;
-		TWeakObjectPtr<USplineMeshComponent> Bent;
-	};
-	TArray<FBuildSwap> BuildSwaps;
-	int32 BuildSwapsLogged = 0;
+	// 0.4.8: SS piece handle -> its vanilla overlay handle, so hide/unhide and data writes can be mirrored.
+	TMap<const FInstanceOwnershipHandle*, FInstanceOwnerHandlePtr> Mirror;
+	bool bMirroring = false;
+	int32 MirrorLogged = 0;
+
 	int32 OverlaysAdded = 0;
 
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
@@ -211,83 +207,6 @@ namespace
 		}
 	}
 
-	/** Replace the game's straight construction meshes on SS rails with bent spline meshes. */
-	void FixConstruction()
-	{
-		static UStaticMesh* RailMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/SS_Mod/Mesh/Steel/SM_TrainRail_New.SM_TrainRail_New"), nullptr, LOAD_NoWarn | LOAD_Quiet);
-		// Clean up ours once the game's component is gone.
-		for (int32 i = BuildSwaps.Num() - 1; i >= 0; --i)
-		{
-			UStaticMeshComponent* O = BuildSwaps[i].Original.Get();
-			if (!O || !O->IsRegistered() || O->IsBeingDestroyed())
-			{
-				if (USplineMeshComponent* B = BuildSwaps[i].Bent.Get())
-				{
-					B->DestroyComponent();
-				}
-				BuildSwaps.RemoveAtSwap(i);
-			}
-		}
-		if (!RailMesh)
-		{
-			return;
-		}
-		for (auto& Pair : RailSplines)
-		{
-			AActor* A = Pair.Key.Get();
-			if (!A || Pair.Value.Num() == 0)
-			{
-				continue;
-			}
-			TInlineComponentArray<UStaticMeshComponent*> Comps(A);
-			for (UStaticMeshComponent* C : Comps)
-			{
-				if (Cast<USplineMeshComponent>(C) || C->GetStaticMesh() != RailMesh || !C->IsVisible())
-				{
-					continue;
-				}
-				// The piece whose start is nearest this component.
-				const FVector Loc = C->GetComponentLocation();
-				const FRailSpline* Best = nullptr;
-				double BestDist = TNumericLimits<double>::Max();
-				for (const FRailSpline& RS : Pair.Value)
-				{
-					const double Dist = FVector::DistSquared(Loc, RS.P0);
-					if (Dist < BestDist)
-					{
-						BestDist = Dist;
-						Best = &RS;
-					}
-				}
-				if (!Best)
-				{
-					continue;
-				}
-				const FTransform T = C->GetComponentTransform();
-				USplineMeshComponent* B = NewObject<USplineMeshComponent>(A);
-				B->SetMobility(EComponentMobility::Movable);
-				B->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-				B->SetStaticMesh(RailMesh);
-				B->SetupAttachment(A->GetRootComponent());
-				B->RegisterComponent();
-				B->SetWorldTransform(T);
-				B->SetStartAndEnd(T.InverseTransformPosition(Best->P0), T.InverseTransformVector(Best->T0),
-					T.InverseTransformPosition(Best->P1), T.InverseTransformVector(Best->T1), true);
-				for (int32 Slot = 0; Slot < C->GetNumMaterials(); ++Slot)
-				{
-					B->SetMaterial(Slot, C->GetMaterial(Slot));
-				}
-				C->SetVisibility(false);
-				BuildSwaps.Add({C, B});
-				if (BuildSwapsLogged++ < 6)
-				{
-					UE_LOG(LogSSBeamRailFix, Display, TEXT("BUILDSWAP %s.%s -> bent spline mesh (start offset %.0f, mat %s)"), *A->GetName(), *C->GetName(),
-						FMath::Sqrt(BestDist), *GetNameSafe(C->GetMaterial(0)));
-				}
-			}
-		}
-	}
-
 	void StartHighlightProbe(UWorld* World)
 	{
 		if (bProbeStarted || !World)
@@ -295,8 +214,6 @@ namespace
 			return;
 		}
 		bProbeStarted = true;
-		FTimerHandle FastHandle;
-		World->GetTimerManager().SetTimer(FastHandle, FTimerDelegate::CreateLambda([]() { FixConstruction(); }), 0.05f, true);
 		FTimerHandle Handle;
 		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
 		{
@@ -424,7 +341,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.7 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.8 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -481,24 +398,13 @@ void FSSBeamRailFixModule::StartupModule()
 
 	SUBSCRIBE_METHOD_AFTER(AAbstractInstanceManager::SetInstanced,
 		[](AAbstractInstanceManager* Manager, AActor* Owner, const FTransform& ActorTransform, const FInstanceData& Instance,
-			FInstanceOwnerHandlePtr& Handle, bool)
+			FInstanceOwnerHandlePtr& Handle, bool bInitializeHidden)
 		{
 			if (bAddingOverlay || !Owner || Owner->GetClass()->GetName() != TEXT("Build_SteelBeam_TrainRail_C") || !Handle.IsValid())
 			{
 				return;
 			}
 			RailHandles.Add(Handle);
-			{
-				const TArray<float>& F = Instance.DefaultPerInstanceCustomData;
-				if (F.Num() >= 27)
-				{
-					FRailSpline& RS = RailSplines.FindOrAdd(Owner).AddDefaulted_GetRef();
-					RS.P0 = FVector(F[15], F[16], F[17]);
-					RS.T0 = FVector(F[18], F[19], F[20]);
-					RS.P1 = FVector(F[21], F[22], F[23]);
-					RS.T1 = FVector(F[24], F[25], F[26]);
-				}
-			}
 			if (!bAddingOverlay && Manager)
 			{
 				static UStaticMesh* VanillaMesh = LoadObject<UStaticMesh>(nullptr, VanillaMeshPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
@@ -510,10 +416,15 @@ void FSSBeamRailFixModule::StartupModule()
 					FOverlay& O = Overlays.FindOrAdd(Owner).AddDefaulted_GetRef();
 					O.Manager = Manager;
 					TGuardValue<bool> Guard(bAddingOverlay, true);
-					Manager->SetInstanced(Owner, ActorTransform, Copy, O.Handle, false);
+					Manager->SetInstanced(Owner, ActorTransform, Copy, O.Handle, bInitializeHidden);
+					if (O.Handle.IsValid())
+					{
+						Mirror.Add(Handle.Get(), O.Handle);
+					}
 					if (OverlaysAdded++ < 3)
 					{
-						UE_LOG(LogSSBeamRailFix, Display, TEXT("OVERLAY vanilla track instance added for %s (handle valid %d)."), *Owner->GetName(), O.Handle.IsValid() ? 1 : 0);
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("OVERLAY vanilla track instance added for %s (handle valid %d, initially hidden %d)."), *Owner->GetName(),
+							O.Handle.IsValid() ? 1 : 0, bInitializeHidden ? 1 : 0);
 					}
 				}
 				else if (OverlaysAdded == 0)
@@ -530,20 +441,50 @@ void FSSBeamRailFixModule::StartupModule()
 		});
 
 	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::SetPrimitiveDataByArray,
-		[](const FInstanceOwnershipHandle* Self, const TArray<float>& Data, bool)
+		[](const FInstanceOwnershipHandle* Self, const TArray<float>& Data, bool bMarkDirty)
 		{
+			if (!bMirroring)
+			{
+				if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
+				{
+					if (M->IsValid())
+					{
+						TGuardValue<bool> Guard(bMirroring, true);
+						(*M)->SetPrimitiveDataByArray(Data, bMarkDirty);
+					}
+				}
+			}
+			if (bMirroring)
+			{
+				return;
+			}
 			static int32 Logged = 0;
 			const int32 Index = Logged < 120 ? RailIndex(Self) : INDEX_NONE;
 			if (Index != INDEX_NONE)
 			{
 				++Logged;
-				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, 6));
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, 28));
 			}
 		});
 
 	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::SetPrimitiveDataByID,
-		[](const FInstanceOwnershipHandle* Self, float Value, const int32 Index, bool)
+		[](const FInstanceOwnershipHandle* Self, float Value, const int32 Index, bool bMarkDirty)
 		{
+			if (!bMirroring)
+			{
+				if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
+				{
+					if (M->IsValid())
+					{
+						TGuardValue<bool> Guard(bMirroring, true);
+						(*M)->SetPrimitiveDataByID(Value, Index, bMarkDirty);
+					}
+				}
+			}
+			if (bMirroring)
+			{
+				return;
+			}
 			static int32 Logged = 0;
 			const int32 Piece = Logged < 60 ? RailIndex(Self) : INDEX_NONE;
 			if (Piece != INDEX_NONE)
@@ -553,18 +494,67 @@ void FSSBeamRailFixModule::StartupModule()
 			}
 		});
 
+	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::HideInstance,
+		[](FInstanceOwnershipHandle* Self, bool bMarkDirty)
+		{
+			if (bMirroring)
+			{
+				return;
+			}
+			if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
+			{
+				if (M->IsValid())
+				{
+					TGuardValue<bool> Guard(bMirroring, true);
+					(*M)->HideInstance(bMarkDirty);
+					if (MirrorLogged++ < 12)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("MIRROR hide"));
+					}
+				}
+			}
+		});
+
+	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::UnHideInstance,
+		[](FInstanceOwnershipHandle* Self, bool bMarkDirty)
+		{
+			if (bMirroring)
+			{
+				return;
+			}
+			if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
+			{
+				if (M->IsValid())
+				{
+					TGuardValue<bool> Guard(bMirroring, true);
+					(*M)->UnHideInstance(bMarkDirty);
+					if (MirrorLogged++ < 12)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("MIRROR unhide"));
+					}
+				}
+			}
+		});
+
 	// Remove our overlay instances when an SS rail is dismantled or unloaded.
 	SUBSCRIBE_METHOD_VIRTUAL(AFGBuildable::EndPlay, GetMutableDefault<AFGBuildable>(),
 		[](auto& Scope, AFGBuildable* Self, const EEndPlayReason::Type Reason)
 		{
 			TArray<FOverlay> List;
-			if (Self)
-			{
-				RailSplines.Remove(Self);
-			}
 			if (!Self || !Overlays.RemoveAndCopyValue(Self, List))
 			{
 				return;
+			}
+			for (auto It = Mirror.CreateIterator(); It; ++It)
+			{
+				for (const FOverlay& O : List)
+				{
+					if (It.Value() == O.Handle)
+					{
+						It.RemoveCurrent();
+						break;
+					}
+				}
 			}
 			for (FOverlay& O : List)
 			{
