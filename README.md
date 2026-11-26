@@ -10,6 +10,8 @@ This mod draws the rail with its own material, `M_SSRail`, instead. The material
 
 On top of each beam piece, the mod also places the game's own track piece (its mesh and material, loaded from the game at runtime). That way the steel rail and deck look exactly like vanilla track. These extra pieces are removed when the beam piece is dismantled.
 
+While you place beam railway, its build hologram uses the game's own track material instead of SS's broken one, so the preview isn't grey either.
+
 ## Requirements
 
 - Structural Solutions by D4rk (1.1.47 or newer). It's listed as an optional dependency, and the fix does nothing without it.
@@ -45,4 +47,4 @@ The repo root is the plugin folder. Put it in an SML starter project under `Mods
 1. **Only if the material changes:** close the Unreal Editor and rebuild it with `Scripts/make_M_SSRail.py`. Run it through the editor's Python commandlet: `UnrealEditor-Cmd.exe <FactoryGame.uproject> -run=pythonscript -script=<path to make_M_SSRail.py>`. It needs the Python Editor Script Plugin. If `M_SSRail` already exists, the script loads it and rebuilds its graph in place, so there's no need to move the old one aside.
 2. Package with Alpakit, or with `RunUAT PackagePlugin -DLCName=SSBeamRailFix`.
 
-`tools/rebuild-0.4.5.ps1` writes the current `.uplugin`, C++ source and material script into the mod folder. By default that's the repo root; use `-mod <path>` to point it elsewhere.
+`tools/rebuild-0.4.6.ps1` writes the current `.uplugin` and C++ source into the mod folder (the material didn't change in 0.4.6). By default that's the repo root; use `-mod <path>` to point it elsewhere.

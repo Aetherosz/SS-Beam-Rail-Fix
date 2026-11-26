@@ -19,6 +19,12 @@
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.6: hologram. SS's Holo_RailRoadTrack_Custom draws SM_TrainRail_New on a StaticMeshComponent plus
+ * SplineMeshComponents with the broken MI_Tack_SS. While an SS rail hologram exists, its MI_Tack_SS slots
+ * are switched to the game's own MI_Tack_01 (what the vanilla track hologram uses on its spline meshes).
+ * Logging adds each hologram material's parent and its "Bypass WPO" value, for SS and vanilla.
+ * Probe: the dismantle highlight shows straight, unbent SS chunks. Every 0.5 s, log any mesh components
+ * that appear on SS rail actors and on a few vanilla track actors (that is what the highlight draws with).
  * 0.4.5: the steel rail and deck must look identical to vanilla track. SS's mesh is a vanilla track
  * section with an I-beam added underneath, and it reuses vanilla's normal and mask textures. So for every
  * SS rail piece we add a second lightweight instance with the game's own track mesh SM_TrainTrack_02 and
@@ -144,6 +150,110 @@ namespace
 		return bSS;
 	}
 
+	int32 HoloSwaps = 0;
+
+	// Highlight probe state.
+	TSet<TWeakObjectPtr<AActor>> VanillaTracks;
+	TSet<FString> ComponentsLogged;
+	bool bProbeStarted = false;
+
+	void LogActorComponents(AActor* Actor, const TCHAR* Kind)
+	{
+		TInlineComponentArray<UMeshComponent*> Meshes(Actor);
+		for (UMeshComponent* M : Meshes)
+		{
+			const FString Key = M->GetPathName();
+			if (ComponentsLogged.Contains(Key) || ComponentsLogged.Num() >= 40)
+			{
+				continue;
+			}
+			ComponentsLogged.Add(Key);
+			FString Mesh, Mats, Data;
+			if (USplineMeshComponent* SM = Cast<USplineMeshComponent>(M))
+			{
+				Mesh = FString::Printf(TEXT("spline mesh=%s"), *GetPathNameSafe(SM->GetStaticMesh()));
+			}
+			else if (UStaticMeshComponent* S = Cast<UStaticMeshComponent>(M))
+			{
+				Mesh = FString::Printf(TEXT("mesh=%s"), *GetPathNameSafe(S->GetStaticMesh()));
+			}
+			for (int32 Slot = 0; Slot < M->GetNumMaterials(); ++Slot)
+			{
+				UMaterialInterface* Mat = M->GetMaterial(Slot);
+				UMaterialInstance* MI = Cast<UMaterialInstance>(Mat);
+				Mats += FString::Printf(TEXT("%s%s(parent %s)"), Slot ? TEXT(", ") : TEXT(""), *GetNameSafe(Mat), MI ? *GetNameSafe(MI->Parent) : TEXT("-"));
+			}
+			const TArray<float>& CPD = M->GetCustomPrimitiveData().Data;
+			for (int32 i = 0; i < CPD.Num() && i < 28; ++i)
+			{
+				Data += FString::Printf(TEXT("%s%d:%.1f"), i ? TEXT(" ") : TEXT(""), i, CPD[i]);
+			}
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("HIGHLIGHT %s %s: %s (%s) %s visible=%d mats=[%s] cpd%d=[%s]"), Kind, *Actor->GetName(), *M->GetName(),
+				*M->GetClass()->GetName(), *Mesh, M->IsVisible() ? 1 : 0, *Mats, CPD.Num(), *Data);
+		}
+	}
+
+	void StartHighlightProbe(UWorld* World)
+	{
+		if (bProbeStarted || !World)
+		{
+			return;
+		}
+		bProbeStarted = true;
+		FTimerHandle Handle;
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
+		{
+			if (ComponentsLogged.Num() >= 40)
+			{
+				return;
+			}
+			for (const auto& Pair : Overlays)
+			{
+				if (AActor* A = Pair.Key.Get())
+				{
+					LogActorComponents(A, TEXT("SS"));
+				}
+			}
+			for (const TWeakObjectPtr<AActor>& W : VanillaTracks)
+			{
+				if (AActor* A = W.Get())
+				{
+					LogActorComponents(A, TEXT("VANILLA"));
+				}
+			}
+		}), 0.5f, true);
+	}
+
+	/** Switch any MI_Tack_SS on an SS rail hologram to the game's MI_Tack_01. Spline meshes are added while dragging, so this runs repeatedly. */
+	void FixHologram(AFGHologram* Holo)
+	{
+		static UMaterialInterface* Vanilla = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/FactoryGame/Buildable/Factory/Train/Track/Material/MI_Tack_01.MI_Tack_01"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+		UMaterialInterface* BrokenMaterial = Broken.Get();
+		if (!BrokenMaterial)
+		{
+			BrokenMaterial = LoadObject<UMaterialInterface>(nullptr, BrokenMaterialPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+		}
+		if (!Vanilla || !BrokenMaterial)
+		{
+			return;
+		}
+		TInlineComponentArray<UMeshComponent*> Meshes(Holo);
+		for (UMeshComponent* M : Meshes)
+		{
+			for (int32 Slot = 0; Slot < M->GetNumMaterials(); ++Slot)
+			{
+				if (M->GetMaterial(Slot) == BrokenMaterial)
+				{
+					M->SetMaterial(Slot, Vanilla);
+					if (HoloSwaps++ < 5)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("HOLOSWAP %s.%s slot %d -> MI_Tack_01"), *Holo->GetName(), *M->GetName(), Slot);
+					}
+				}
+			}
+		}
+	}
+
 	void DescribeHologram(AFGHologram* Holo)
 	{
 		TInlineComponentArray<UMeshComponent*> Meshes(Holo);
@@ -166,6 +276,19 @@ namespace
 				Mesh = FString::Printf(TEXT("mesh=%s"), *GetPathNameSafe(S->GetStaticMesh()));
 			}
 			UE_LOG(LogSSBeamRailFix, Display, TEXT("  %s (%s) %s mats=[%s]"), *M->GetName(), *M->GetClass()->GetName(), *Mesh, *Mats);
+			for (int32 Slot = 0; Slot < M->GetNumMaterials(); ++Slot)
+			{
+				UMaterialInterface* Mat = M->GetMaterial(Slot);
+				UMaterialInstance* MI = Cast<UMaterialInstance>(Mat);
+				float Bypass = -1.f;
+				if (Mat)
+				{
+					Mat->GetScalarParameterValue(FHashedMaterialParameterInfo(TEXT("Bypass WPO")), Bypass);
+				}
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("    slot %d: %s (%s) parent=%s base=%s BypassWPO=%.1f"), Slot, *GetNameSafe(Mat),
+					Mat ? *Mat->GetClass()->GetName() : TEXT("none"), MI ? *GetPathNameSafe(MI->Parent) : TEXT("-"),
+					Mat ? *GetNameSafe(Mat->GetBaseMaterial()) : TEXT("-"), Bypass);
+			}
 		}
 	}
 
@@ -204,16 +327,21 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.5 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.6 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
 			FInstanceOwnerHandlePtr&, bool)
 		{
+			if (!bAddingOverlay && Owner && VanillaTracks.Num() < 10 && Owner->GetClass()->GetName() == TEXT("Build_RailroadTrack_C"))
+			{
+				VanillaTracks.Add(Owner);
+			}
 			if (bAddingOverlay || !Owner || !Instance.StaticMesh || !IsFromSS(Owner->GetClass()))
 			{
 				return;
 			}
+			StartHighlightProbe(Owner->GetWorld());
 			UMaterialInstanceDynamic* MID = GetReplacement();
 			UMaterialInterface* BrokenMaterial = Broken.Get();
 			if (!MID || !BrokenMaterial)
@@ -341,7 +469,7 @@ void FSSBeamRailFixModule::StartupModule()
 	SUBSCRIBE_METHOD_VIRTUAL_AFTER(AFGHologram::BeginPlay, GetMutableDefault<AFGHologram>(),
 		[](AFGHologram* Self)
 		{
-			if (!Self || HologramsLogged >= 6)
+			if (!Self)
 			{
 				return;
 			}
@@ -351,10 +479,33 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				return;
 			}
+			UWorld* World = Self->GetWorld();
+			if (Name == TEXT("Build_SteelBeam_TrainRail_C") && World)
+			{
+				FixHologram(Self);
+				TSharedRef<FTimerHandle> Repeat = MakeShared<FTimerHandle>();
+				TWeakObjectPtr<AFGHologram> WeakHolo(Self);
+				TWeakObjectPtr<UWorld> WeakWorld(World);
+				World->GetTimerManager().SetTimer(*Repeat, FTimerDelegate::CreateLambda([WeakHolo, WeakWorld, Repeat]()
+				{
+					if (AFGHologram* H = WeakHolo.Get())
+					{
+						FixHologram(H);
+					}
+					else if (UWorld* W = WeakWorld.Get())
+					{
+						W->GetTimerManager().ClearTimer(*Repeat);
+					}
+				}), 0.1f, true);
+			}
+			if (HologramsLogged >= 6)
+			{
+				return;
+			}
 			++HologramsLogged;
 			FTimerHandle Handle;
 			TWeakObjectPtr<AFGHologram> Weak(Self);
-			Self->GetWorld()->GetTimerManager().SetTimer(Handle, [Weak]()
+			World->GetTimerManager().SetTimer(Handle, [Weak]()
 			{
 				if (AFGHologram* H = Weak.Get())
 				{
