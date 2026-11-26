@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.4: writes source, uplugin and the UPDATED material script. Stops if the Unreal Editor is running.
+# SSBeamRailFix 0.4.5: writes source, uplugin and the UPDATED material script. Stops if the Unreal Editor is running.
 # Then: 1) rerun the material script (M_SSRail changed: beam-only paint mask, new params):
 #          UnrealEditor-Cmd.exe "<starter FactoryGame.uproject>" -run=pythonscript -script="$mod\Scripts\make_M_SSRail.py"
 #          success line "M_SSRail created and saved" is in SML\Saved\Logs\FactoryGame.log
@@ -11,8 +11,8 @@ New-Item -ItemType Directory -Force "$mod\Scripts","$mod\Content\Materials" | Ou
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.4.4",
-	"SemVersion": "0.4.4",
+	"VersionName": "0.4.5",
+	"SemVersion": "0.4.5",
 	"GameVersion": ">=520140",
 	"FriendlyName": "SS Beam Rail Fix (private test)",
 	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",
@@ -62,10 +62,17 @@ New-Item -ItemType Directory -Force "$mod\Scripts","$mod\Content\Materials" | Ou
 #include "TimerManager.h"
 #include "Engine/World.h"
 #include "Patching/NativeHookManager.h"
+#include "Buildables/FGBuildable.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.5: the steel rail and deck must look identical to vanilla track. SS's mesh is a vanilla track
+ * section with an I-beam added underneath, and it reuses vanilla's normal and mask textures. So for every
+ * SS rail piece we add a second lightweight instance with the game's own track mesh SM_TrainTrack_02 and
+ * its own material MI_Tack_01 (cooked, bends on the same per-instance spline data), and M_SSRail clips
+ * its rail region (ClipRail). Overlay instances are removed when the SS piece ends play.
+ * ssrail.ClipRail 0 shows our old rail again (for comparison).
  * 0.4.4: unpainted steel rail darkened and desaturated to match the game's track steel
  * (ssrail.RailBright, ssrail.RailSat).
  * 0.4.3: paint mask uses the pre-bend local position (vertex interpolator), so the steel rail stays
@@ -98,6 +105,17 @@ namespace
 
 	// 0.4.1: rail piece handles, so we can see whether the paint gun writes new paint to them.
 	TArray<FInstanceOwnerHandlePtr> RailHandles;
+
+	// 0.4.5: vanilla track overlay instances, per SS rail actor.
+	const TCHAR* VanillaMeshPath = TEXT("/Game/FactoryGame/Buildable/Factory/Train/Track/Mesh/SM_TrainTrack_02.SM_TrainTrack_02");
+	struct FOverlay
+	{
+		TWeakObjectPtr<AAbstractInstanceManager> Manager;
+		FInstanceOwnerHandlePtr Handle;
+	};
+	TMap<TWeakObjectPtr<AActor>, TArray<FOverlay>> Overlays;
+	bool bAddingOverlay = false;
+	int32 OverlaysAdded = 0;
 
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
 	{
@@ -132,6 +150,9 @@ namespace
 	TAutoConsoleVariable<float> CVarRailSat(TEXT("ssrail.RailSat"), 0.3f,
 		TEXT("Colour saturation of the unpainted steel rail, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarClipRail(TEXT("ssrail.ClipRail"), 1.f,
+		TEXT("1: hide our rail region and show the game's own track on top, 0: show ours."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarDetail(TEXT("ssrail.PaintDetail"), 0.25f,
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -153,9 +174,10 @@ namespace
 			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f"), CVarPaintMode.GetValueOnGameThread(),
+			MID->SetScalarParameterValue(TEXT("ClipRail"), CVarClipRail.GetValueOnGameThread());
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f"), CVarPaintMode.GetValueOnGameThread(),
 				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
-				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread());
+				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread());
 		}
 	}
 
@@ -230,13 +252,13 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.4 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.5 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
 			FInstanceOwnerHandlePtr&, bool)
 		{
-			if (!Owner || !Instance.StaticMesh || !IsFromSS(Owner->GetClass()))
+			if (bAddingOverlay || !Owner || !Instance.StaticMesh || !IsFromSS(Owner->GetClass()))
 			{
 				return;
 			}
@@ -281,14 +303,37 @@ void FSSBeamRailFixModule::StartupModule()
 		});
 
 	SUBSCRIBE_METHOD_AFTER(AAbstractInstanceManager::SetInstanced,
-		[](AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
+		[](AAbstractInstanceManager* Manager, AActor* Owner, const FTransform& ActorTransform, const FInstanceData& Instance,
 			FInstanceOwnerHandlePtr& Handle, bool)
 		{
-			if (!Owner || Owner->GetClass()->GetName() != TEXT("Build_SteelBeam_TrainRail_C") || !Handle.IsValid())
+			if (bAddingOverlay || !Owner || Owner->GetClass()->GetName() != TEXT("Build_SteelBeam_TrainRail_C") || !Handle.IsValid())
 			{
 				return;
 			}
 			RailHandles.Add(Handle);
+			if (!bAddingOverlay && Manager)
+			{
+				static UStaticMesh* VanillaMesh = LoadObject<UStaticMesh>(nullptr, VanillaMeshPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+				if (VanillaMesh)
+				{
+					FInstanceData Copy = Instance;
+					Copy.StaticMesh = VanillaMesh;
+					Copy.OverridenMaterials.Reset();
+					FOverlay& O = Overlays.FindOrAdd(Owner).AddDefaulted_GetRef();
+					O.Manager = Manager;
+					TGuardValue<bool> Guard(bAddingOverlay, true);
+					Manager->SetInstanced(Owner, ActorTransform, Copy, O.Handle, false);
+					if (OverlaysAdded++ < 3)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("OVERLAY vanilla track instance added for %s (handle valid %d)."), *Owner->GetName(), O.Handle.IsValid() ? 1 : 0);
+					}
+				}
+				else if (OverlaysAdded == 0)
+				{
+					OverlaysAdded = -1000;
+					UE_LOG(LogSSBeamRailFix, Warning, TEXT("OVERLAY: vanilla mesh %s not found."), VanillaMeshPath);
+				}
+			}
 			static int32 Logged = 0;
 			if (Logged++ < 3)
 			{
@@ -317,6 +362,27 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				++Logged;
 				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece %d: %d = %f"), Piece, Index, Value);
+			}
+		});
+
+	// Remove our overlay instances when an SS rail is dismantled or unloaded.
+	SUBSCRIBE_METHOD_VIRTUAL(AFGBuildable::EndPlay, GetMutableDefault<AFGBuildable>(),
+		[](auto& Scope, AFGBuildable* Self, const EEndPlayReason::Type Reason)
+		{
+			TArray<FOverlay> List;
+			if (!Self || !Overlays.RemoveAndCopyValue(Self, List))
+			{
+				return;
+			}
+			for (FOverlay& O : List)
+			{
+				if (AAbstractInstanceManager* M = O.Manager.Get())
+				{
+					if (O.Handle.IsValid())
+					{
+						M->RemoveInstance(O.Handle);
+					}
+				}
 			}
 		});
 
@@ -350,7 +416,7 @@ void FSSBeamRailFixModule::StartupModule()
 IMPLEMENT_MODULE(FSSBeamRailFixModule, SSBeamRailFix)
 '@ | Set-Content -Encoding UTF8 "$mod\Source\SSBeamRailFix\Private\SSBeamRailFixModule.cpp"
 @'
-# SSBeamRailFix 0.4.4: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.5: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -378,6 +444,9 @@ else:
 if mat is None:
     raise RuntimeError('M_SSRail could not be loaded or created')
 mat.set_editor_property('used_with_instanced_static_meshes', True)
+# 0.4.5: the steel rail and deck are drawn by the game's own track mesh and material on top of ours,
+# so this material clips its own rail region away (ClipRail 1) and only draws the I-beam.
+mat.set_editor_property('blend_mode', unreal.BlendMode.BLEND_MASKED)
 
 
 def node(cls, x, y, **props):
@@ -479,6 +548,14 @@ link(scalar('PaintDetail', 0.25, -900, 280), '', paint, 'Detail')
 vi = node(unreal.MaterialExpressionVertexInterpolator, -700, 340)
 link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
 link(vi, '', paint, 'LP')
+CLIP = '''
+return (Clip > 0.5 && LP.z > RailZ) ? 0 : 1;
+'''
+clip = custom(-400, 1100, CLIP, ['LP', 'RailZ', 'Clip'], unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+link(vi, '', clip, 'LP')
+link(scalar('RailZ', 0.0, -900, 1100), '', clip, 'RailZ')
+link(scalar('ClipRail', 1.0, -900, 1160), '', clip, 'Clip')
+MEL.connect_material_property(clip, '', unreal.MaterialProperty.MP_OPACITY_MASK)
 link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
 link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
 # 0.4.4: the unpainted steel rail showed SS's raw albedo, lighter and warmer than the game's dark steel
@@ -487,8 +564,33 @@ link(scalar('RailBright', 0.45, -900, 520), '', paint, 'RailBright')
 link(scalar('RailSat', 0.3, -900, 580), '', paint, 'RailSat')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
 
+# 0.4.5: bend the normals too. Before, every piece kept the lighting of its unbent start direction, so
+# shading stepped at each piece boundary along a curve (hard bands). Now the normal map is taken into the
+# mesh's own space and turned with the same spline frame the bend uses, output in world space.
+mat.set_editor_property('tangent_space_normal', False)
 normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
-MEL.connect_material_property(normal, 'RGB', unreal.MaterialProperty.MP_NORMAL)
+to_local = node(unreal.MaterialExpressionTransform, -700, 800,
+                transform_source_type=unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_TANGENT,
+                transform_type=unreal.MaterialVectorCoordTransform.TRANSFORM_INSTANCE)
+link(normal, 'RGB', to_local, '')
+BENTN = '''
+float t = saturate(LP.x / Len);
+float t2 = t * t;
+float3 D = (6*t2 - 6*t) * P0 + (3*t2 - 4*t + 1) * T0 + (-6*t2 + 6*t) * P1 + (3*t2 - 2*t) * T1;
+float3 F = normalize(D + float3(1e-4, 0, 0));
+float3 R = normalize(cross(float3(0, 0, 1), F));
+float3 U = cross(F, R);
+return normalize(F * N.x + R * N.y + U * N.z);
+'''
+bentn = custom(-400, 800, BENTN, ['N', 'LP', 'P0', 'T0', 'P1', 'T1', 'Len'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+link(to_local, '', bentn, 'N')
+link(vi, '', bentn, 'LP')
+link(data3(15, -900, 1300), '', bentn, 'P0')
+link(data3(18, -900, 1360), '', bentn, 'T0')
+link(data3(21, -900, 1420), '', bentn, 'P1')
+link(data3(24, -900, 1480), '', bentn, 'T1')
+link(scalar('Length', 1200.0, -900, 1540), '', bentn, 'Len')
+MEL.connect_material_property(bentn, '', unreal.MaterialProperty.MP_NORMAL)
 MEL.connect_material_property(scalar('Roughness', 0.6, -400, 900), '', unreal.MaterialProperty.MP_ROUGHNESS)
 MEL.connect_material_property(scalar('Metallic', 0.0, -400, 960), '', unreal.MaterialProperty.MP_METALLIC)
 
@@ -496,4 +598,4 @@ MEL.recompile_material(mat)
 EAL.save_asset(PATH)
 unreal.log('SSBeamRailFix: M_SSRail created and saved at ' + PATH)
 '@ | Set-Content -Encoding UTF8 "$mod\Scripts\make_M_SSRail.py"
-Write-Host 'Source is 0.4.4. Run make_M_SSRail.py in the editor commandlet (loads and updates M_SSRail in place; no need to move it aside), then PackagePlugin (-DLCName=SSBeamRailFix).'
+Write-Host 'Source is 0.4.5. Run make_M_SSRail.py in the editor commandlet (updates M_SSRail in place), then PackagePlugin (-DLCName=SSBeamRailFix).'

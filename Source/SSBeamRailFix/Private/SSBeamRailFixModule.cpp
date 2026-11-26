@@ -14,10 +14,17 @@
 #include "TimerManager.h"
 #include "Engine/World.h"
 #include "Patching/NativeHookManager.h"
+#include "Buildables/FGBuildable.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.5: the steel rail and deck must look identical to vanilla track. SS's mesh is a vanilla track
+ * section with an I-beam added underneath, and it reuses vanilla's normal and mask textures. So for every
+ * SS rail piece we add a second lightweight instance with the game's own track mesh SM_TrainTrack_02 and
+ * its own material MI_Tack_01 (cooked, bends on the same per-instance spline data), and M_SSRail clips
+ * its rail region (ClipRail). Overlay instances are removed when the SS piece ends play.
+ * ssrail.ClipRail 0 shows our old rail again (for comparison).
  * 0.4.4: unpainted steel rail darkened and desaturated to match the game's track steel
  * (ssrail.RailBright, ssrail.RailSat).
  * 0.4.3: paint mask uses the pre-bend local position (vertex interpolator), so the steel rail stays
@@ -50,6 +57,17 @@ namespace
 
 	// 0.4.1: rail piece handles, so we can see whether the paint gun writes new paint to them.
 	TArray<FInstanceOwnerHandlePtr> RailHandles;
+
+	// 0.4.5: vanilla track overlay instances, per SS rail actor.
+	const TCHAR* VanillaMeshPath = TEXT("/Game/FactoryGame/Buildable/Factory/Train/Track/Mesh/SM_TrainTrack_02.SM_TrainTrack_02");
+	struct FOverlay
+	{
+		TWeakObjectPtr<AAbstractInstanceManager> Manager;
+		FInstanceOwnerHandlePtr Handle;
+	};
+	TMap<TWeakObjectPtr<AActor>, TArray<FOverlay>> Overlays;
+	bool bAddingOverlay = false;
+	int32 OverlaysAdded = 0;
 
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
 	{
@@ -84,6 +102,9 @@ namespace
 	TAutoConsoleVariable<float> CVarRailSat(TEXT("ssrail.RailSat"), 0.3f,
 		TEXT("Colour saturation of the unpainted steel rail, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarClipRail(TEXT("ssrail.ClipRail"), 1.f,
+		TEXT("1: hide our rail region and show the game's own track on top, 0: show ours."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarDetail(TEXT("ssrail.PaintDetail"), 0.25f,
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -105,9 +126,10 @@ namespace
 			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f"), CVarPaintMode.GetValueOnGameThread(),
+			MID->SetScalarParameterValue(TEXT("ClipRail"), CVarClipRail.GetValueOnGameThread());
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f"), CVarPaintMode.GetValueOnGameThread(),
 				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
-				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread());
+				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread());
 		}
 	}
 
@@ -182,13 +204,13 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.4 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.5 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
 			FInstanceOwnerHandlePtr&, bool)
 		{
-			if (!Owner || !Instance.StaticMesh || !IsFromSS(Owner->GetClass()))
+			if (bAddingOverlay || !Owner || !Instance.StaticMesh || !IsFromSS(Owner->GetClass()))
 			{
 				return;
 			}
@@ -233,14 +255,37 @@ void FSSBeamRailFixModule::StartupModule()
 		});
 
 	SUBSCRIBE_METHOD_AFTER(AAbstractInstanceManager::SetInstanced,
-		[](AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
+		[](AAbstractInstanceManager* Manager, AActor* Owner, const FTransform& ActorTransform, const FInstanceData& Instance,
 			FInstanceOwnerHandlePtr& Handle, bool)
 		{
-			if (!Owner || Owner->GetClass()->GetName() != TEXT("Build_SteelBeam_TrainRail_C") || !Handle.IsValid())
+			if (bAddingOverlay || !Owner || Owner->GetClass()->GetName() != TEXT("Build_SteelBeam_TrainRail_C") || !Handle.IsValid())
 			{
 				return;
 			}
 			RailHandles.Add(Handle);
+			if (!bAddingOverlay && Manager)
+			{
+				static UStaticMesh* VanillaMesh = LoadObject<UStaticMesh>(nullptr, VanillaMeshPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+				if (VanillaMesh)
+				{
+					FInstanceData Copy = Instance;
+					Copy.StaticMesh = VanillaMesh;
+					Copy.OverridenMaterials.Reset();
+					FOverlay& O = Overlays.FindOrAdd(Owner).AddDefaulted_GetRef();
+					O.Manager = Manager;
+					TGuardValue<bool> Guard(bAddingOverlay, true);
+					Manager->SetInstanced(Owner, ActorTransform, Copy, O.Handle, false);
+					if (OverlaysAdded++ < 3)
+					{
+						UE_LOG(LogSSBeamRailFix, Display, TEXT("OVERLAY vanilla track instance added for %s (handle valid %d)."), *Owner->GetName(), O.Handle.IsValid() ? 1 : 0);
+					}
+				}
+				else if (OverlaysAdded == 0)
+				{
+					OverlaysAdded = -1000;
+					UE_LOG(LogSSBeamRailFix, Warning, TEXT("OVERLAY: vanilla mesh %s not found."), VanillaMeshPath);
+				}
+			}
 			static int32 Logged = 0;
 			if (Logged++ < 3)
 			{
@@ -269,6 +314,27 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				++Logged;
 				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece %d: %d = %f"), Piece, Index, Value);
+			}
+		});
+
+	// Remove our overlay instances when an SS rail is dismantled or unloaded.
+	SUBSCRIBE_METHOD_VIRTUAL(AFGBuildable::EndPlay, GetMutableDefault<AFGBuildable>(),
+		[](auto& Scope, AFGBuildable* Self, const EEndPlayReason::Type Reason)
+		{
+			TArray<FOverlay> List;
+			if (!Self || !Overlays.RemoveAndCopyValue(Self, List))
+			{
+				return;
+			}
+			for (FOverlay& O : List)
+			{
+				if (AAbstractInstanceManager* M = O.Manager.Get())
+				{
+					if (O.Handle.IsValid())
+					{
+						M->RemoveInstance(O.Handle);
+					}
+				}
 			}
 		});
 

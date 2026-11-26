@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.4: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.5: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -26,6 +26,9 @@ else:
 if mat is None:
     raise RuntimeError('M_SSRail could not be loaded or created')
 mat.set_editor_property('used_with_instanced_static_meshes', True)
+# 0.4.5: the steel rail and deck are drawn by the game's own track mesh and material on top of ours,
+# so this material clips its own rail region away (ClipRail 1) and only draws the I-beam.
+mat.set_editor_property('blend_mode', unreal.BlendMode.BLEND_MASKED)
 
 
 def node(cls, x, y, **props):
@@ -127,6 +130,14 @@ link(scalar('PaintDetail', 0.25, -900, 280), '', paint, 'Detail')
 vi = node(unreal.MaterialExpressionVertexInterpolator, -700, 340)
 link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
 link(vi, '', paint, 'LP')
+CLIP = '''
+return (Clip > 0.5 && LP.z > RailZ) ? 0 : 1;
+'''
+clip = custom(-400, 1100, CLIP, ['LP', 'RailZ', 'Clip'], unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+link(vi, '', clip, 'LP')
+link(scalar('RailZ', 0.0, -900, 1100), '', clip, 'RailZ')
+link(scalar('ClipRail', 1.0, -900, 1160), '', clip, 'Clip')
+MEL.connect_material_property(clip, '', unreal.MaterialProperty.MP_OPACITY_MASK)
 link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
 link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
 # 0.4.4: the unpainted steel rail showed SS's raw albedo, lighter and warmer than the game's dark steel
@@ -135,8 +146,33 @@ link(scalar('RailBright', 0.45, -900, 520), '', paint, 'RailBright')
 link(scalar('RailSat', 0.3, -900, 580), '', paint, 'RailSat')
 MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
 
+# 0.4.5: bend the normals too. Before, every piece kept the lighting of its unbent start direction, so
+# shading stepped at each piece boundary along a curve (hard bands). Now the normal map is taken into the
+# mesh's own space and turned with the same spline frame the bend uses, output in world space.
+mat.set_editor_property('tangent_space_normal', False)
 normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
-MEL.connect_material_property(normal, 'RGB', unreal.MaterialProperty.MP_NORMAL)
+to_local = node(unreal.MaterialExpressionTransform, -700, 800,
+                transform_source_type=unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_TANGENT,
+                transform_type=unreal.MaterialVectorCoordTransform.TRANSFORM_INSTANCE)
+link(normal, 'RGB', to_local, '')
+BENTN = '''
+float t = saturate(LP.x / Len);
+float t2 = t * t;
+float3 D = (6*t2 - 6*t) * P0 + (3*t2 - 4*t + 1) * T0 + (-6*t2 + 6*t) * P1 + (3*t2 - 2*t) * T1;
+float3 F = normalize(D + float3(1e-4, 0, 0));
+float3 R = normalize(cross(float3(0, 0, 1), F));
+float3 U = cross(F, R);
+return normalize(F * N.x + R * N.y + U * N.z);
+'''
+bentn = custom(-400, 800, BENTN, ['N', 'LP', 'P0', 'T0', 'P1', 'T1', 'Len'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+link(to_local, '', bentn, 'N')
+link(vi, '', bentn, 'LP')
+link(data3(15, -900, 1300), '', bentn, 'P0')
+link(data3(18, -900, 1360), '', bentn, 'T0')
+link(data3(21, -900, 1420), '', bentn, 'P1')
+link(data3(24, -900, 1480), '', bentn, 'T1')
+link(scalar('Length', 1200.0, -900, 1540), '', bentn, 'Len')
+MEL.connect_material_property(bentn, '', unreal.MaterialProperty.MP_NORMAL)
 MEL.connect_material_property(scalar('Roughness', 0.6, -400, 900), '', unreal.MaterialProperty.MP_ROUGHNESS)
 MEL.connect_material_property(scalar('Metallic', 0.0, -400, 960), '', unreal.MaterialProperty.MP_METALLIC)
 
