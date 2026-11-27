@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.5: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.10: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -173,8 +173,28 @@ link(data3(21, -900, 1420), '', bentn, 'P1')
 link(data3(24, -900, 1480), '', bentn, 'T1')
 link(scalar('Length', 1200.0, -900, 1540), '', bentn, 'Len')
 MEL.connect_material_property(bentn, '', unreal.MaterialProperty.MP_NORMAL)
-MEL.connect_material_property(scalar('Roughness', 0.6, -400, 900), '', unreal.MaterialProperty.MP_ROUGHNESS)
-MEL.connect_material_property(scalar('Metallic', 0.0, -400, 960), '', unreal.MaterialProperty.MP_METALLIC)
+# 0.4.10: paint finishes. The game writes metallic to float 9 (0 default, 1 for metal finishes such as
+# copper) and roughness to float 10 (1 default, 0.5 copper), in-game logs 2026-11-27. Pieces whose paint
+# data is still all zero (not yet written) fall back to the default look. Roughness = our base roughness
+# (0.6, the value Sir approved for the default paint) times the finish's float 10, so default paint is unchanged.
+FINISH = '''
+bool unset = dot(Prim, float3(1, 1, 1)) < 0.001 && Rough < 0.001;
+float metal = unset ? 0 : saturate(Metal) * FinishAmt;
+float rough = unset ? 1 : saturate(Rough);
+return float2(metal, saturate(DefRough * lerp(1, rough, FinishAmt)));
+'''
+finish = custom(-400, 900, FINISH, ['Prim', 'Metal', 'Rough', 'DefRough', 'FinishAmt'], unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+link(data3(0, -900, 1700), '', finish, 'Prim')
+link(node(unreal.MaterialExpressionPerInstanceCustomData, -900, 1760, data_index=9), '', finish, 'Metal')
+link(node(unreal.MaterialExpressionPerInstanceCustomData, -900, 1820, data_index=10), '', finish, 'Rough')
+link(scalar('Roughness', 0.6, -900, 1880), '', finish, 'DefRough')
+link(scalar('FinishAmt', 1.0, -900, 1940), '', finish, 'FinishAmt')
+mask_r = node(unreal.MaterialExpressionComponentMask, -200, 900, r=True, g=False, b=False, a=False)
+mask_g = node(unreal.MaterialExpressionComponentMask, -200, 960, r=False, g=True, b=False, a=False)
+link(finish, '', mask_r, '')
+link(finish, '', mask_g, '')
+MEL.connect_material_property(mask_r, '', unreal.MaterialProperty.MP_METALLIC)
+MEL.connect_material_property(mask_g, '', unreal.MaterialProperty.MP_ROUGHNESS)
 
 MEL.recompile_material(mat)
 EAL.save_asset(PATH)

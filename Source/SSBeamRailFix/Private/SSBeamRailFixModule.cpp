@@ -15,10 +15,20 @@
 #include "Engine/World.h"
 #include "Patching/NativeHookManager.h"
 #include "Buildables/FGBuildable.h"
+#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.10: paint finishes. The game writes a finish as per-instance data: index 9 metallic (0 default,
+ * 1 for finishes like copper) and index 10 roughness (1 default, 0.5 copper), in-game logs 2026-11-27.
+ * M_SSRail now reads both for the beam. The vanilla rail overlay no longer receives the SS piece's
+ * paint data (indices 0-14 stay at their initial values), so a finish no longer tints the steel rail;
+ * spline and state data (15+) are still mirrored.
+ * Probe: in 0.4.9 no highlight component ever appeared on a tracked SS rail actor. Now every second,
+ * every SM_TrainRail_New mesh component anywhere in the world is logged once (owner, class, spline or
+ * not, visibility, material), with a heartbeat so a stopped timer shows. SS piece hides are logged too.
+ * PAINTWRITE logs indices 0-14 only when they change for that piece.
  * 0.4.9: dismantle highlight. While highlighted, the game hides the SS pieces and draws straight copies
  * (plain StaticMeshComponents, SM_TrainRail_New, Factory_Materialize MID). 0.4.8 also hid our vanilla
  * rail then, so the straight copies showed fully. Now: hide is no longer mirrored (only the initial hidden
@@ -107,6 +117,15 @@ namespace
 
 	int32 OverlaysAdded = 0;
 
+	// 0.4.10: indices 0-14 are paint/finish (0-5 colours, 6 power, 7-8 pattern, 9 metallic, 10 roughness,
+	// 11-13 light colour). The vanilla rail overlay keeps its own values for these.
+	constexpr int32 PaintSlots = 15;
+	TMap<const FInstanceOwnershipHandle*, TArray<float>> LastPaint;
+	int32 PaintLogged = 0;
+	int32 HidesLogged = 0;
+	TSet<FString> RailCompsLogged;
+	int32 ProbeTicks = 0;
+
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
 	{
 		for (int32 i = 0; i < RailHandles.Num(); ++i)
@@ -149,6 +168,12 @@ namespace
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 
+	TAutoConsoleVariable<float> CVarRoughness(TEXT("ssrail.Roughness"), 0.6f,
+		TEXT("Base roughness of the I-beam; the paint finish's roughness multiplies it."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarFinish(TEXT("ssrail.Finish"), 1.f,
+		TEXT("1: apply paint finishes (metallic/roughness) to the I-beam, 0: ignore them."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarPaintMode(TEXT("ssrail.PaintMode"), 6.f,
 		TEXT("SS rail paint area: 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo, 6 below RailZ (I-beam body), 7 debug split view."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -167,6 +192,8 @@ namespace
 			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("ClipRail"), CVarClipRail.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("Roughness"), CVarRoughness.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("FinishAmt"), CVarFinish.GetValueOnGameThread());
 			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f"), CVarPaintMode.GetValueOnGameThread(),
 				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
 				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread());
@@ -188,44 +215,7 @@ namespace
 
 	// Highlight probe state.
 	TSet<TWeakObjectPtr<AActor>> VanillaTracks;
-	TSet<FString> ComponentsLogged;
 	bool bProbeStarted = false;
-
-	void LogActorComponents(AActor* Actor, const TCHAR* Kind)
-	{
-		TInlineComponentArray<UMeshComponent*> Meshes(Actor);
-		for (UMeshComponent* M : Meshes)
-		{
-			const FString Key = M->GetPathName();
-			if (ComponentsLogged.Contains(Key) || ComponentsLogged.Num() >= 40)
-			{
-				continue;
-			}
-			ComponentsLogged.Add(Key);
-			FString Mesh, Mats, Data;
-			if (USplineMeshComponent* SM = Cast<USplineMeshComponent>(M))
-			{
-				Mesh = FString::Printf(TEXT("spline mesh=%s"), *GetPathNameSafe(SM->GetStaticMesh()));
-			}
-			else if (UStaticMeshComponent* S = Cast<UStaticMeshComponent>(M))
-			{
-				Mesh = FString::Printf(TEXT("mesh=%s"), *GetPathNameSafe(S->GetStaticMesh()));
-			}
-			for (int32 Slot = 0; Slot < M->GetNumMaterials(); ++Slot)
-			{
-				UMaterialInterface* Mat = M->GetMaterial(Slot);
-				UMaterialInstance* MI = Cast<UMaterialInstance>(Mat);
-				Mats += FString::Printf(TEXT("%s%s(parent %s)"), Slot ? TEXT(", ") : TEXT(""), *GetNameSafe(Mat), MI ? *GetNameSafe(MI->Parent) : TEXT("-"));
-			}
-			const TArray<float>& CPD = M->GetCustomPrimitiveData().Data;
-			for (int32 i = 0; i < CPD.Num() && i < 28; ++i)
-			{
-				Data += FString::Printf(TEXT("%s%d:%.1f"), i ? TEXT(" ") : TEXT(""), i, CPD[i]);
-			}
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("HIGHLIGHT %s %s: %s (%s) %s visible=%d mats=[%s] cpd%d=[%s]"), Kind, *Actor->GetName(), *M->GetName(),
-				*M->GetClass()->GetName(), *Mesh, M->IsVisible() ? 1 : 0, *Mats, CPD.Num(), *Data);
-		}
-	}
 
 	/** Replace the game's straight dismantle-highlight meshes on SS rails with bent spline meshes. */
 	void FixConstruction()
@@ -316,25 +306,38 @@ namespace
 		FTimerHandle Handle;
 		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
 		{
-			if (ComponentsLogged.Num() >= 40)
+			static UStaticMesh* RailMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/SS_Mod/Mesh/Steel/SM_TrainRail_New.SM_TrainRail_New"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+			++ProbeTicks;
+			int32 Found = 0, Visible = 0;
+			for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
 			{
-				return;
-			}
-			for (const auto& Pair : Overlays)
-			{
-				if (AActor* A = Pair.Key.Get())
+				UStaticMeshComponent* C = *It;
+				if (!C || C->GetStaticMesh() != RailMesh || C->IsTemplate() || !C->IsRegistered())
 				{
-					LogActorComponents(A, TEXT("SS"));
+					continue;
 				}
-			}
-			for (const TWeakObjectPtr<AActor>& W : VanillaTracks)
-			{
-				if (AActor* A = W.Get())
+				++Found;
+				Visible += C->IsVisible() ? 1 : 0;
+				const FString Key = C->GetPathName();
+				if (RailCompsLogged.Num() >= 80 || RailCompsLogged.Contains(Key))
 				{
-					LogActorComponents(A, TEXT("VANILLA"));
+					continue;
 				}
+				RailCompsLogged.Add(Key);
+				AActor* A = C->GetOwner();
+				const bool bOurs = BuildSwaps.ContainsByPredicate([C](const FBuildSwap& S) { return S.Bent.Get() == C; });
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("RAILCOMP %s owner=%s (%s) tracked=%d %s ours=%d visible=%d loc=%s mat=%s(parent %s)"), *C->GetName(),
+					*GetNameSafe(A), A ? *A->GetClass()->GetName() : TEXT("-"), A && RailSplines.Contains(A) ? 1 : 0,
+					Cast<USplineMeshComponent>(C) ? TEXT("spline") : TEXT("static"), bOurs ? 1 : 0, C->IsVisible() ? 1 : 0,
+					*C->GetComponentLocation().ToString(), *GetNameSafe(C->GetMaterial(0)),
+					Cast<UMaterialInstance>(C->GetMaterial(0)) ? *GetNameSafe(Cast<UMaterialInstance>(C->GetMaterial(0))->Parent) : TEXT("-"));
 			}
-		}), 0.5f, true);
+			if (ProbeTicks == 1 || ProbeTicks % 60 == 0)
+			{
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("PROBE tick %d: %d SM_TrainRail_New components (%d visible), %d tracked SS actors, %d bent swaps"),
+					ProbeTicks, Found, Visible, RailSplines.Num(), BuildSwaps.Num());
+			}
+		}), 1.0f, true);
 	}
 
 	/** Switch any MI_Tack_SS on an SS rail hologram to the game's MI_Tack_01. Spline meshes are added while dragging, so this runs repeatedly. */
@@ -440,7 +443,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.9 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.10 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -523,6 +526,10 @@ void FSSBeamRailFixModule::StartupModule()
 					FInstanceData Copy = Instance;
 					Copy.StaticMesh = VanillaMesh;
 					Copy.OverridenMaterials.Reset();
+					for (int32 i = 0; i < PaintSlots && i < Copy.DefaultPerInstanceCustomData.Num(); ++i)
+					{
+						Copy.DefaultPerInstanceCustomData[i] = 0.f;
+					}
 					FOverlay& O = Overlays.FindOrAdd(Owner).AddDefaulted_GetRef();
 					O.Manager = Manager;
 					TGuardValue<bool> Guard(bAddingOverlay, true);
@@ -560,7 +567,12 @@ void FSSBeamRailFixModule::StartupModule()
 					if (M->IsValid())
 					{
 						TGuardValue<bool> Guard(bMirroring, true);
-						(*M)->SetPrimitiveDataByArray(Data, bMarkDirty);
+						TArray<float> Rail = Data;
+						for (int32 i = 0; i < PaintSlots && i < Rail.Num(); ++i)
+						{
+							Rail[i] = 0.f;
+						}
+						(*M)->SetPrimitiveDataByArray(Rail, bMarkDirty);
 					}
 				}
 			}
@@ -568,12 +580,17 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				return;
 			}
-			static int32 Logged = 0;
-			const int32 Index = Logged < 120 ? RailIndex(Self) : INDEX_NONE;
+			const int32 Index = PaintLogged < 150 ? RailIndex(Self) : INDEX_NONE;
 			if (Index != INDEX_NONE)
 			{
-				++Logged;
-				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, 28));
+				TArray<float> Paint(Data.GetData(), FMath::Min(Data.Num(), PaintSlots));
+				TArray<float>& Last = LastPaint.FindOrAdd(Self);
+				if (Last != Paint)
+				{
+					Last = Paint;
+					++PaintLogged;
+					UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, PaintSlots));
+				}
 			}
 		});
 
@@ -584,7 +601,7 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
 				{
-					if (M->IsValid())
+					if (M->IsValid() && Index >= PaintSlots)
 					{
 						TGuardValue<bool> Guard(bMirroring, true);
 						(*M)->SetPrimitiveDataByID(Value, Index, bMarkDirty);
@@ -602,6 +619,18 @@ void FSSBeamRailFixModule::StartupModule()
 				++Logged;
 				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece %d: %d = %f"), Piece, Index, Value);
 			}
+		});
+
+	// 0.4.10: log (not mirror) hides of SS pieces, to see when the game hides them for the highlight.
+	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::HideInstance,
+		[](FInstanceOwnershipHandle* Self, bool)
+		{
+			if (bMirroring || HidesLogged >= 30 || !Mirror.Contains(Self))
+			{
+				return;
+			}
+			++HidesLogged;
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("HIDE rail piece %d"), RailIndex(Self));
 		});
 
 	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::UnHideInstance,

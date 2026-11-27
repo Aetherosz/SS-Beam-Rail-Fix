@@ -1,15 +1,18 @@
-# SSBeamRailFix 0.4.9: writes source and uplugin only. M_SSRail is unchanged from 0.4.5, so NO editor step.
-# Then the usual PackagePlugin -DLCName=SSBeamRailFix.
+# SSBeamRailFix 0.4.10: writes source, uplugin and the UPDATED material script. Stops if the Unreal Editor is running.
+# Then: 1) rerun the material script (M_SSRail changed: metallic/roughness from the paint finish, floats 9 and 10):
+#          UnrealEditor-Cmd.exe "<starter FactoryGame.uproject>" -run=pythonscript -script="$mod\Scripts\make_M_SSRail.py"
+#          success line "M_SSRail created and saved" is in SML\Saved\Logs\FactoryGame.log
+#       2) the usual PackagePlugin -DLCName=SSBeamRailFix.
 param([string]$mod = (Split-Path -Parent $PSScriptRoot))  # the mod folder (repo root); pass -mod to write elsewhere
 $ErrorActionPreference = 'Stop'
 if (Get-Process UnrealEditor -ErrorAction SilentlyContinue) { throw 'Close the Unreal Editor, then rerun.' }
-if (-not (Test-Path "$mod\Content\Materials\M_SSRail.uasset")) { throw 'M_SSRail.uasset missing.' }
+New-Item -ItemType Directory -Force "$mod\Scripts","$mod\Content\Materials" | Out-Null
 @'
 {
 	"FileVersion": 3,
 	"Version": 0,
-	"VersionName": "0.4.9",
-	"SemVersion": "0.4.9",
+	"VersionName": "0.4.10",
+	"SemVersion": "0.4.10",
 	"GameVersion": ">=520140",
 	"FriendlyName": "SS Beam Rail Fix (private test)",
 	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",
@@ -60,10 +63,20 @@ if (-not (Test-Path "$mod\Content\Materials\M_SSRail.uasset")) { throw 'M_SSRail
 #include "Engine/World.h"
 #include "Patching/NativeHookManager.h"
 #include "Buildables/FGBuildable.h"
+#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.10: paint finishes. The game writes a finish as per-instance data: index 9 metallic (0 default,
+ * 1 for finishes like copper) and index 10 roughness (1 default, 0.5 copper), in-game logs 2026-11-27.
+ * M_SSRail now reads both for the beam. The vanilla rail overlay no longer receives the SS piece's
+ * paint data (indices 0-14 stay at their initial values), so a finish no longer tints the steel rail;
+ * spline and state data (15+) are still mirrored.
+ * Probe: in 0.4.9 no highlight component ever appeared on a tracked SS rail actor. Now every second,
+ * every SM_TrainRail_New mesh component anywhere in the world is logged once (owner, class, spline or
+ * not, visibility, material), with a heartbeat so a stopped timer shows. SS piece hides are logged too.
+ * PAINTWRITE logs indices 0-14 only when they change for that piece.
  * 0.4.9: dismantle highlight. While highlighted, the game hides the SS pieces and draws straight copies
  * (plain StaticMeshComponents, SM_TrainRail_New, Factory_Materialize MID). 0.4.8 also hid our vanilla
  * rail then, so the straight copies showed fully. Now: hide is no longer mirrored (only the initial hidden
@@ -152,6 +165,15 @@ namespace
 
 	int32 OverlaysAdded = 0;
 
+	// 0.4.10: indices 0-14 are paint/finish (0-5 colours, 6 power, 7-8 pattern, 9 metallic, 10 roughness,
+	// 11-13 light colour). The vanilla rail overlay keeps its own values for these.
+	constexpr int32 PaintSlots = 15;
+	TMap<const FInstanceOwnershipHandle*, TArray<float>> LastPaint;
+	int32 PaintLogged = 0;
+	int32 HidesLogged = 0;
+	TSet<FString> RailCompsLogged;
+	int32 ProbeTicks = 0;
+
 	int32 RailIndex(const FInstanceOwnershipHandle* Self)
 	{
 		for (int32 i = 0; i < RailHandles.Num(); ++i)
@@ -194,6 +216,12 @@ namespace
 		TEXT("How much texture detail shows through the paint, 0..1."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 
+	TAutoConsoleVariable<float> CVarRoughness(TEXT("ssrail.Roughness"), 0.6f,
+		TEXT("Base roughness of the I-beam; the paint finish's roughness multiplies it."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
+	TAutoConsoleVariable<float> CVarFinish(TEXT("ssrail.Finish"), 1.f,
+		TEXT("1: apply paint finishes (metallic/roughness) to the I-beam, 0: ignore them."),
+		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
 	TAutoConsoleVariable<float> CVarPaintMode(TEXT("ssrail.PaintMode"), 6.f,
 		TEXT("SS rail paint area: 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo, 6 below RailZ (I-beam body), 7 debug split view."),
 		FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyConsoleValues(); }));
@@ -212,6 +240,8 @@ namespace
 			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("ClipRail"), CVarClipRail.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("Roughness"), CVarRoughness.GetValueOnGameThread());
+			MID->SetScalarParameterValue(TEXT("FinishAmt"), CVarFinish.GetValueOnGameThread());
 			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f"), CVarPaintMode.GetValueOnGameThread(),
 				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
 				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread());
@@ -233,44 +263,7 @@ namespace
 
 	// Highlight probe state.
 	TSet<TWeakObjectPtr<AActor>> VanillaTracks;
-	TSet<FString> ComponentsLogged;
 	bool bProbeStarted = false;
-
-	void LogActorComponents(AActor* Actor, const TCHAR* Kind)
-	{
-		TInlineComponentArray<UMeshComponent*> Meshes(Actor);
-		for (UMeshComponent* M : Meshes)
-		{
-			const FString Key = M->GetPathName();
-			if (ComponentsLogged.Contains(Key) || ComponentsLogged.Num() >= 40)
-			{
-				continue;
-			}
-			ComponentsLogged.Add(Key);
-			FString Mesh, Mats, Data;
-			if (USplineMeshComponent* SM = Cast<USplineMeshComponent>(M))
-			{
-				Mesh = FString::Printf(TEXT("spline mesh=%s"), *GetPathNameSafe(SM->GetStaticMesh()));
-			}
-			else if (UStaticMeshComponent* S = Cast<UStaticMeshComponent>(M))
-			{
-				Mesh = FString::Printf(TEXT("mesh=%s"), *GetPathNameSafe(S->GetStaticMesh()));
-			}
-			for (int32 Slot = 0; Slot < M->GetNumMaterials(); ++Slot)
-			{
-				UMaterialInterface* Mat = M->GetMaterial(Slot);
-				UMaterialInstance* MI = Cast<UMaterialInstance>(Mat);
-				Mats += FString::Printf(TEXT("%s%s(parent %s)"), Slot ? TEXT(", ") : TEXT(""), *GetNameSafe(Mat), MI ? *GetNameSafe(MI->Parent) : TEXT("-"));
-			}
-			const TArray<float>& CPD = M->GetCustomPrimitiveData().Data;
-			for (int32 i = 0; i < CPD.Num() && i < 28; ++i)
-			{
-				Data += FString::Printf(TEXT("%s%d:%.1f"), i ? TEXT(" ") : TEXT(""), i, CPD[i]);
-			}
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("HIGHLIGHT %s %s: %s (%s) %s visible=%d mats=[%s] cpd%d=[%s]"), Kind, *Actor->GetName(), *M->GetName(),
-				*M->GetClass()->GetName(), *Mesh, M->IsVisible() ? 1 : 0, *Mats, CPD.Num(), *Data);
-		}
-	}
 
 	/** Replace the game's straight dismantle-highlight meshes on SS rails with bent spline meshes. */
 	void FixConstruction()
@@ -361,25 +354,38 @@ namespace
 		FTimerHandle Handle;
 		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
 		{
-			if (ComponentsLogged.Num() >= 40)
+			static UStaticMesh* RailMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/SS_Mod/Mesh/Steel/SM_TrainRail_New.SM_TrainRail_New"), nullptr, LOAD_NoWarn | LOAD_Quiet);
+			++ProbeTicks;
+			int32 Found = 0, Visible = 0;
+			for (TObjectIterator<UStaticMeshComponent> It; It; ++It)
 			{
-				return;
-			}
-			for (const auto& Pair : Overlays)
-			{
-				if (AActor* A = Pair.Key.Get())
+				UStaticMeshComponent* C = *It;
+				if (!C || C->GetStaticMesh() != RailMesh || C->IsTemplate() || !C->IsRegistered())
 				{
-					LogActorComponents(A, TEXT("SS"));
+					continue;
 				}
-			}
-			for (const TWeakObjectPtr<AActor>& W : VanillaTracks)
-			{
-				if (AActor* A = W.Get())
+				++Found;
+				Visible += C->IsVisible() ? 1 : 0;
+				const FString Key = C->GetPathName();
+				if (RailCompsLogged.Num() >= 80 || RailCompsLogged.Contains(Key))
 				{
-					LogActorComponents(A, TEXT("VANILLA"));
+					continue;
 				}
+				RailCompsLogged.Add(Key);
+				AActor* A = C->GetOwner();
+				const bool bOurs = BuildSwaps.ContainsByPredicate([C](const FBuildSwap& S) { return S.Bent.Get() == C; });
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("RAILCOMP %s owner=%s (%s) tracked=%d %s ours=%d visible=%d loc=%s mat=%s(parent %s)"), *C->GetName(),
+					*GetNameSafe(A), A ? *A->GetClass()->GetName() : TEXT("-"), A && RailSplines.Contains(A) ? 1 : 0,
+					Cast<USplineMeshComponent>(C) ? TEXT("spline") : TEXT("static"), bOurs ? 1 : 0, C->IsVisible() ? 1 : 0,
+					*C->GetComponentLocation().ToString(), *GetNameSafe(C->GetMaterial(0)),
+					Cast<UMaterialInstance>(C->GetMaterial(0)) ? *GetNameSafe(Cast<UMaterialInstance>(C->GetMaterial(0))->Parent) : TEXT("-"));
 			}
-		}), 0.5f, true);
+			if (ProbeTicks == 1 || ProbeTicks % 60 == 0)
+			{
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("PROBE tick %d: %d SM_TrainRail_New components (%d visible), %d tracked SS actors, %d bent swaps"),
+					ProbeTicks, Found, Visible, RailSplines.Num(), BuildSwaps.Num());
+			}
+		}), 1.0f, true);
 	}
 
 	/** Switch any MI_Tack_SS on an SS rail hologram to the game's MI_Tack_01. Spline meshes are added while dragging, so this runs repeatedly. */
@@ -485,7 +491,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.9 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.10 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,
@@ -568,6 +574,10 @@ void FSSBeamRailFixModule::StartupModule()
 					FInstanceData Copy = Instance;
 					Copy.StaticMesh = VanillaMesh;
 					Copy.OverridenMaterials.Reset();
+					for (int32 i = 0; i < PaintSlots && i < Copy.DefaultPerInstanceCustomData.Num(); ++i)
+					{
+						Copy.DefaultPerInstanceCustomData[i] = 0.f;
+					}
 					FOverlay& O = Overlays.FindOrAdd(Owner).AddDefaulted_GetRef();
 					O.Manager = Manager;
 					TGuardValue<bool> Guard(bAddingOverlay, true);
@@ -605,7 +615,12 @@ void FSSBeamRailFixModule::StartupModule()
 					if (M->IsValid())
 					{
 						TGuardValue<bool> Guard(bMirroring, true);
-						(*M)->SetPrimitiveDataByArray(Data, bMarkDirty);
+						TArray<float> Rail = Data;
+						for (int32 i = 0; i < PaintSlots && i < Rail.Num(); ++i)
+						{
+							Rail[i] = 0.f;
+						}
+						(*M)->SetPrimitiveDataByArray(Rail, bMarkDirty);
 					}
 				}
 			}
@@ -613,12 +628,17 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				return;
 			}
-			static int32 Logged = 0;
-			const int32 Index = Logged < 120 ? RailIndex(Self) : INDEX_NONE;
+			const int32 Index = PaintLogged < 150 ? RailIndex(Self) : INDEX_NONE;
 			if (Index != INDEX_NONE)
 			{
-				++Logged;
-				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, 28));
+				TArray<float> Paint(Data.GetData(), FMath::Min(Data.Num(), PaintSlots));
+				TArray<float>& Last = LastPaint.FindOrAdd(Self);
+				if (Last != Paint)
+				{
+					Last = Paint;
+					++PaintLogged;
+					UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE array on rail piece %d of %d: [%s]"), Index, RailHandles.Num(), *FirstFloats(Data, PaintSlots));
+				}
 			}
 		});
 
@@ -629,7 +649,7 @@ void FSSBeamRailFixModule::StartupModule()
 			{
 				if (FInstanceOwnerHandlePtr* M = Mirror.Find(Self))
 				{
-					if (M->IsValid())
+					if (M->IsValid() && Index >= PaintSlots)
 					{
 						TGuardValue<bool> Guard(bMirroring, true);
 						(*M)->SetPrimitiveDataByID(Value, Index, bMarkDirty);
@@ -647,6 +667,18 @@ void FSSBeamRailFixModule::StartupModule()
 				++Logged;
 				UE_LOG(LogSSBeamRailFix, Display, TEXT("PAINTWRITE id on rail piece %d: %d = %f"), Piece, Index, Value);
 			}
+		});
+
+	// 0.4.10: log (not mirror) hides of SS pieces, to see when the game hides them for the highlight.
+	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::HideInstance,
+		[](FInstanceOwnershipHandle* Self, bool)
+		{
+			if (bMirroring || HidesLogged >= 30 || !Mirror.Contains(Self))
+			{
+				return;
+			}
+			++HidesLogged;
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("HIDE rail piece %d"), RailIndex(Self));
 		});
 
 	SUBSCRIBE_METHOD_AFTER(FInstanceOwnershipHandle::UnHideInstance,
@@ -758,4 +790,207 @@ void FSSBeamRailFixModule::StartupModule()
 
 IMPLEMENT_MODULE(FSSBeamRailFixModule, SSBeamRailFix)
 '@ | Set-Content -Encoding UTF8 "$mod\Source\SSBeamRailFix\Private\SSBeamRailFixModule.cpp"
-Write-Host 'Source is 0.4.9. Package with PackagePlugin (-DLCName=SSBeamRailFix).'
+@'
+# SSBeamRailFix 0.4.10: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
+# Needs the editor's Python Editor Script Plugin enabled in the starter project.
+#
+# A brand-new base material (not a child of the game's MM_FactoryBaked_Spline), so it is compiled
+# and cooked into our own pak. It bends each rail piece on the GPU from the per-instance data the
+# game already writes (in-game logs 2026-11-24):
+#   floats 0-2  primary paint (FICSIT orange 0.953 0.302 0.067), 3-5 secondary
+#   floats 15-17 start position (world), 18-20 start tangent, 21-23 end position, 24-26 end tangent
+#   mesh SM_TrainRail_New runs X 0..1200 (= Length)
+import unreal
+
+MEL = unreal.MaterialEditingLibrary
+EAL = unreal.EditorAssetLibrary
+PKG = '/SSBeamRailFix/Materials'
+NAME = 'M_SSRail'
+PATH = PKG + '/' + NAME
+
+# Reuse the existing asset. In the commandlet does_asset_exist is False until the registry scans the
+# plugin, and delete-and-recreate fails unattended, so load first and create only if that fails.
+mat = unreal.load_asset(PATH)
+if mat is not None:
+    MEL.delete_all_material_expressions(mat)
+else:
+    mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(NAME, PKG, unreal.Material, unreal.MaterialFactoryNew())
+if mat is None:
+    raise RuntimeError('M_SSRail could not be loaded or created')
+mat.set_editor_property('used_with_instanced_static_meshes', True)
+# 0.4.5: the steel rail and deck are drawn by the game's own track mesh and material on top of ours,
+# so this material clips its own rail region away (ClipRail 1) and only draws the I-beam.
+mat.set_editor_property('blend_mode', unreal.BlendMode.BLEND_MASKED)
+
+
+def node(cls, x, y, **props):
+    n = MEL.create_material_expression(mat, cls, x, y)
+    for k, v in props.items():
+        n.set_editor_property(k, v)
+    return n
+
+
+def custom(x, y, code, inputs, out_type):
+    n = node(unreal.MaterialExpressionCustom, x, y)
+    n.set_editor_property('code', code)
+    n.set_editor_property('output_type', out_type)
+    ins = []
+    for name in inputs:
+        ci = unreal.CustomInput()
+        ci.set_editor_property('input_name', name)
+        ins.append(ci)
+    n.set_editor_property('inputs', ins)
+    return n
+
+
+def link(a, a_out, b, b_in):
+    if not MEL.connect_material_expressions(a, a_out, b, b_in):
+        raise RuntimeError('link failed: %s.%s -> %s.%s' % (a.get_name(), a_out, b.get_name(), b_in))
+
+
+def data3(index, x, y):
+    return node(unreal.MaterialExpressionPerInstanceCustomData3Vector, x, y, data_index=index)
+
+
+def scalar(name, value, x, y):
+    return node(unreal.MaterialExpressionScalarParameter, x, y, parameter_name=name, default_value=value)
+
+
+def texture(name, sampler, default, x, y):
+    return node(unreal.MaterialExpressionTextureSampleParameter2D, x, y, parameter_name=name,
+                sampler_type=sampler, texture=unreal.load_asset(default))
+
+
+# ---- bend (World Position Offset) ----
+BEND = '''
+float t = saturate(LP.x / Len);
+float t2 = t * t, t3 = t2 * t;
+float3 P = (2*t3 - 3*t2 + 1) * P0 + (t3 - 2*t2 + t) * T0 + (-2*t3 + 3*t2) * P1 + (t3 - t2) * T1;
+float3 D = (6*t2 - 6*t) * P0 + (3*t2 - 4*t + 1) * T0 + (-6*t2 + 6*t) * P1 + (3*t2 - 2*t) * T1;
+float3 F = normalize(D + float3(1e-4, 0, 0));
+float3 R = normalize(cross(float3(0, 0, 1), F));
+float3 U = cross(F, R);
+return (P + R * LP.y + U * LP.z) - WP;
+'''
+bend = custom(-400, 400, BEND, ['LP', 'WP', 'P0', 'T0', 'P1', 'T1', 'Len'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+link(node(unreal.MaterialExpressionLocalPosition, -900, 300), '', bend, 'LP')
+link(node(unreal.MaterialExpressionWorldPosition, -900, 360,
+          world_position_shader_offset=unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS), '', bend, 'WP')
+link(data3(15, -900, 420), '', bend, 'P0')
+link(data3(18, -900, 480), '', bend, 'T0')
+link(data3(21, -900, 540), '', bend, 'P1')
+link(data3(24, -900, 600), '', bend, 'T1')
+link(scalar('Length', 1200.0, -900, 660), '', bend, 'Len')
+MEL.connect_material_property(bend, '', unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
+
+# ---- colour and paint ----
+# PaintMode picks which part gets painted:
+# 0 whole mesh, 1-4 AOMasks R/G/B/A, 5 coloured parts of the albedo,
+# 7 debug: red below RailZ, green above, banded every 50 units of local height.
+# 6 (default, 0.4.2) everything below local height RailZ: the I-beam body. The mesh spans Z -400..135,
+#   so the beam is presumed to be -400..0 and the steel rail on top 0..135. RailZ/RailBlend are tunable live.
+# Painted colour = swatch colour with light texture detail (Detail), so it matches the straight I-beams.
+PAINT = '''
+float3 prim = Prim;
+if (dot(prim, float3(1, 1, 1)) < 0.001) prim = float3(0.953, 0.302, 0.067);
+float lum = dot(Alb, float3(0.299, 0.587, 0.114));
+int mode = (int)round(Mode);
+float m = 1;
+if (mode == 1) m = Masks.r;
+else if (mode == 2) m = Masks.g;
+else if (mode == 3) m = Masks.b;
+else if (mode == 4) m = Masks.a;
+else if (mode == 5) m = saturate((max(Alb.r, max(Alb.g, Alb.b)) - min(Alb.r, min(Alb.g, Alb.b))) * 4);
+else if (mode == 6) m = 1 - saturate((LP.z - RailZ) / max(RailBlend, 0.01) + 0.5);
+else if (mode == 7) return lerp(float3(1, 0, 0), float3(0, 1, 0), step(RailZ, LP.z)) * (0.6 + 0.4 * frac(LP.z / 50));
+float3 painted = prim * lerp(1, saturate(lum * Gain), Detail);
+float3 steel = lerp(lum.xxx, Alb, RailSat) * RailBright;
+return lerp(steel, painted, m);
+'''
+paint = custom(-400, -100, PAINT, ['Alb', 'Masks', 'Prim', 'Mode', 'Gain', 'Detail', 'LP', 'RailZ', 'RailBlend', 'RailBright', 'RailSat'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+alb = texture('Albedo', unreal.MaterialSamplerType.SAMPLERTYPE_COLOR, '/Engine/EngineResources/DefaultTexture', -900, -300)
+masks = texture('AOMasks', unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, '/Engine/EngineResources/WhiteSquareTexture', -900, -100)
+link(alb, 'RGB', paint, 'Alb')
+link(masks, 'RGBA', paint, 'Masks')
+link(data3(0, -900, 100), '', paint, 'Prim')
+link(scalar('PaintMode', 6.0, -900, 160), '', paint, 'Mode')
+link(scalar('PaintGain', 2.0, -900, 220), '', paint, 'Gain')
+link(scalar('PaintDetail', 0.25, -900, 280), '', paint, 'Detail')
+# 0.4.3: take the mesh's own local position in the vertex shader, before the bend, and carry it to the
+# pixel shader. In 0.4.2 the pixel-shader LocalPosition was rebuilt from the bent position, so on curved
+# pieces the beam/rail split moved and the steel rail took paint.
+vi = node(unreal.MaterialExpressionVertexInterpolator, -700, 340)
+link(node(unreal.MaterialExpressionLocalPosition, -900, 340), '', vi, '')
+link(vi, '', paint, 'LP')
+CLIP = '''
+return (Clip > 0.5 && LP.z > RailZ) ? 0 : 1;
+'''
+clip = custom(-400, 1100, CLIP, ['LP', 'RailZ', 'Clip'], unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+link(vi, '', clip, 'LP')
+link(scalar('RailZ', 0.0, -900, 1100), '', clip, 'RailZ')
+link(scalar('ClipRail', 1.0, -900, 1160), '', clip, 'Clip')
+MEL.connect_material_property(clip, '', unreal.MaterialProperty.MP_OPACITY_MASK)
+link(scalar('RailZ', 0.0, -900, 400), '', paint, 'RailZ')
+link(scalar('RailBlend', 4.0, -900, 460), '', paint, 'RailBlend')
+# 0.4.4: the unpainted steel rail showed SS's raw albedo, lighter and warmer than the game's dark steel
+# track. Darken and desaturate it; both are tunable live (ssrail.RailBright, ssrail.RailSat).
+link(scalar('RailBright', 0.45, -900, 520), '', paint, 'RailBright')
+link(scalar('RailSat', 0.3, -900, 580), '', paint, 'RailSat')
+MEL.connect_material_property(paint, '', unreal.MaterialProperty.MP_BASE_COLOR)
+
+# 0.4.5: bend the normals too. Before, every piece kept the lighting of its unbent start direction, so
+# shading stepped at each piece boundary along a curve (hard bands). Now the normal map is taken into the
+# mesh's own space and turned with the same spline frame the bend uses, output in world space.
+mat.set_editor_property('tangent_space_normal', False)
+normal = texture('Normal', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL, '/Engine/EngineMaterials/DefaultNormal', -900, 800)
+to_local = node(unreal.MaterialExpressionTransform, -700, 800,
+                transform_source_type=unreal.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_TANGENT,
+                transform_type=unreal.MaterialVectorCoordTransform.TRANSFORM_INSTANCE)
+link(normal, 'RGB', to_local, '')
+BENTN = '''
+float t = saturate(LP.x / Len);
+float t2 = t * t;
+float3 D = (6*t2 - 6*t) * P0 + (3*t2 - 4*t + 1) * T0 + (-6*t2 + 6*t) * P1 + (3*t2 - 2*t) * T1;
+float3 F = normalize(D + float3(1e-4, 0, 0));
+float3 R = normalize(cross(float3(0, 0, 1), F));
+float3 U = cross(F, R);
+return normalize(F * N.x + R * N.y + U * N.z);
+'''
+bentn = custom(-400, 800, BENTN, ['N', 'LP', 'P0', 'T0', 'P1', 'T1', 'Len'], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+link(to_local, '', bentn, 'N')
+link(vi, '', bentn, 'LP')
+link(data3(15, -900, 1300), '', bentn, 'P0')
+link(data3(18, -900, 1360), '', bentn, 'T0')
+link(data3(21, -900, 1420), '', bentn, 'P1')
+link(data3(24, -900, 1480), '', bentn, 'T1')
+link(scalar('Length', 1200.0, -900, 1540), '', bentn, 'Len')
+MEL.connect_material_property(bentn, '', unreal.MaterialProperty.MP_NORMAL)
+# 0.4.10: paint finishes. The game writes metallic to float 9 (0 default, 1 for metal finishes such as
+# copper) and roughness to float 10 (1 default, 0.5 copper), in-game logs 2026-11-27. Pieces whose paint
+# data is still all zero (not yet written) fall back to the default look. Roughness = our base roughness
+# (0.6, the value Sir approved for the default paint) times the finish's float 10, so default paint is unchanged.
+FINISH = '''
+bool unset = dot(Prim, float3(1, 1, 1)) < 0.001 && Rough < 0.001;
+float metal = unset ? 0 : saturate(Metal) * FinishAmt;
+float rough = unset ? 1 : saturate(Rough);
+return float2(metal, saturate(DefRough * lerp(1, rough, FinishAmt)));
+'''
+finish = custom(-400, 900, FINISH, ['Prim', 'Metal', 'Rough', 'DefRough', 'FinishAmt'], unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+link(data3(0, -900, 1700), '', finish, 'Prim')
+link(node(unreal.MaterialExpressionPerInstanceCustomData, -900, 1760, data_index=9), '', finish, 'Metal')
+link(node(unreal.MaterialExpressionPerInstanceCustomData, -900, 1820, data_index=10), '', finish, 'Rough')
+link(scalar('Roughness', 0.6, -900, 1880), '', finish, 'DefRough')
+link(scalar('FinishAmt', 1.0, -900, 1940), '', finish, 'FinishAmt')
+mask_r = node(unreal.MaterialExpressionComponentMask, -200, 900, r=True, g=False, b=False, a=False)
+mask_g = node(unreal.MaterialExpressionComponentMask, -200, 960, r=False, g=True, b=False, a=False)
+link(finish, '', mask_r, '')
+link(finish, '', mask_g, '')
+MEL.connect_material_property(mask_r, '', unreal.MaterialProperty.MP_METALLIC)
+MEL.connect_material_property(mask_g, '', unreal.MaterialProperty.MP_ROUGHNESS)
+
+MEL.recompile_material(mat)
+EAL.save_asset(PATH)
+unreal.log('SSBeamRailFix: M_SSRail created and saved at ' + PATH)
+'@ | Set-Content -Encoding UTF8 "$mod\Scripts\make_M_SSRail.py"
+Write-Host 'Source is 0.4.10. Run make_M_SSRail.py in the editor commandlet (updates M_SSRail in place), then PackagePlugin (-DLCName=SSBeamRailFix).'
