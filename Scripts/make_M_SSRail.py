@@ -1,4 +1,4 @@
-# SSBeamRailFix 0.4.10: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
+# SSBeamRailFix 0.4.11: builds /SSBeamRailFix/Materials/M_SSRail in the SML editor project.
 # Run headless: UnrealEditor-Cmd.exe "<FactoryGame.uproject>" -run=pythonscript -script="<this file>"
 # Needs the editor's Python Editor Script Plugin enabled in the starter project.
 #
@@ -71,6 +71,8 @@ def texture(name, sampler, default, x, y):
 
 # ---- bend (World Position Offset) ----
 BEND = '''
+// 0.4.11: no spline data (both tangents zero) -> leave the piece unbent instead of collapsing it.
+if (dot(T0, T0) + dot(T1, T1) < 1e-6) return float3(0, 0, 0);
 float t = saturate(LP.x / Len);
 float t2 = t * t, t3 = t2 * t;
 float3 P = (2*t3 - 3*t2 + 1) * P0 + (t3 - 2*t2 + t) * T0 + (-2*t3 + 3*t2) * P1 + (t3 - t2) * T1;

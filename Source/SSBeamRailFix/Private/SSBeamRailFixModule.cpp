@@ -16,10 +16,20 @@
 #include "Patching/NativeHookManager.h"
 #include "Buildables/FGBuildable.h"
 #include "UObject/UObjectIterator.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSSBeamRailFix, Log, All);
 
 /*
+ * 0.4.11: dismantle highlight, real cause. In-game logs 2026-11-27 (0.4.10 probe): the dismantle outline
+ * is drawn by InstancedStaticMeshComponents on the player character (not on the rail actor), with
+ * SM_TrainRail_New and SS's MI_Tack_SS, which can't bend. Every 0.05 s, such components on the local
+ * player's pawn get our M_SSRail (a second instance with ClipRail 0, so the whole piece incl. rail is drawn
+ * and outlined), which bends from the same per-instance spline data. Only done when the component carries
+ * at least 27 custom floats; the material also leaves pieces without spline data unbent.
+ * The 0.4.9 spline-mesh swap of rail-actor components is removed (those components never appear).
  * 0.4.10: paint finishes. The game writes a finish as per-instance data: index 9 metallic (0 default,
  * 1 for finishes like copper) and index 10 roughness (1 default, 0.5 copper), in-game logs 2026-11-27.
  * M_SSRail now reads both for the beam. The vanilla rail overlay no longer receives the SS piece's
@@ -79,6 +89,9 @@ namespace
 
 	TWeakObjectPtr<UMaterialInterface> Broken;
 	TWeakObjectPtr<UMaterialInstanceDynamic> Replacement;
+	TWeakObjectPtr<UMaterialInstanceDynamic> HighlightReplacement;
+	TWeakObjectPtr<UWorld> ProbeWorld;
+	int32 HighlightSwapsLogged = 0;
 	bool bTriedBuild = false;
 	TMap<TWeakObjectPtr<UClass>, bool> IsSSClass;
 	int32 Swapped = 0;
@@ -183,20 +196,31 @@ namespace
 
 	void ApplyConsoleValues()
 	{
-		if (UMaterialInstanceDynamic* MID = Replacement.Get())
+		UMaterialInstanceDynamic* MIDs[] = { Replacement.Get(), HighlightReplacement.Get() };
+		for (int32 k = 0; k < 2; ++k)
 		{
+			UMaterialInstanceDynamic* MID = MIDs[k];
+			if (!MID)
+			{
+				continue;
+			}
 			MID->SetScalarParameterValue(TEXT("PaintMode"), CVarPaintMode.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("PaintGain"), CVarPaintGain.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailZ"), CVarRailZ.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("PaintDetail"), CVarDetail.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailBright"), CVarRailBright.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("RailSat"), CVarRailSat.GetValueOnGameThread());
-			MID->SetScalarParameterValue(TEXT("ClipRail"), CVarClipRail.GetValueOnGameThread());
+			// The highlight copy draws the whole piece (rail too), so the outline covers all of it.
+			MID->SetScalarParameterValue(TEXT("ClipRail"), k == 0 ? CVarClipRail.GetValueOnGameThread() : 0.f);
 			MID->SetScalarParameterValue(TEXT("Roughness"), CVarRoughness.GetValueOnGameThread());
 			MID->SetScalarParameterValue(TEXT("FinishAmt"), CVarFinish.GetValueOnGameThread());
-			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f"), CVarPaintMode.GetValueOnGameThread(),
+		}
+		if (Replacement.IsValid())
+		{
+			UE_LOG(LogSSBeamRailFix, Display, TEXT("PaintMode %.0f, PaintGain %.2f, RailZ %.1f, PaintDetail %.2f, RailBright %.2f, RailSat %.2f, ClipRail %.0f, Roughness %.2f, Finish %.0f"), CVarPaintMode.GetValueOnGameThread(),
 				CVarPaintGain.GetValueOnGameThread(), CVarRailZ.GetValueOnGameThread(), CVarDetail.GetValueOnGameThread(),
-				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread());
+				CVarRailBright.GetValueOnGameThread(), CVarRailSat.GetValueOnGameThread(), CVarClipRail.GetValueOnGameThread(),
+				CVarRoughness.GetValueOnGameThread(), CVarFinish.GetValueOnGameThread());
 		}
 	}
 
@@ -217,78 +241,61 @@ namespace
 	TSet<TWeakObjectPtr<AActor>> VanillaTracks;
 	bool bProbeStarted = false;
 
-	/** Replace the game's straight dismantle-highlight meshes on SS rails with bent spline meshes. */
+	/** Give the dismantle-outline ISMs on the player (SM_TrainRail_New with MI_Tack_SS) our bending material. */
 	void FixConstruction()
 	{
 		static UStaticMesh* RailMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/SS_Mod/Mesh/Steel/SM_TrainRail_New.SM_TrainRail_New"), nullptr, LOAD_NoWarn | LOAD_Quiet);
-		// Clean up ours once the game's component is gone.
-		for (int32 i = BuildSwaps.Num() - 1; i >= 0; --i)
-		{
-			UStaticMeshComponent* O = BuildSwaps[i].Original.Get();
-			if (!O || !O->IsRegistered() || O->IsBeingDestroyed())
-			{
-				if (USplineMeshComponent* B = BuildSwaps[i].Bent.Get())
-				{
-					B->DestroyComponent();
-				}
-				BuildSwaps.RemoveAtSwap(i);
-			}
-		}
-		if (!RailMesh || CVarBendHighlight.GetValueOnGameThread() < 0.5f)
+		UWorld* World = ProbeWorld.Get();
+		UMaterialInterface* BrokenMaterial = Broken.Get();
+		UMaterialInstanceDynamic* HMID = HighlightReplacement.Get();
+		if (!RailMesh || !World || !BrokenMaterial || !HMID || CVarBendHighlight.GetValueOnGameThread() < 0.5f)
 		{
 			return;
 		}
-		for (auto& Pair : RailSplines)
+		APlayerController* PC = World->GetFirstPlayerController();
+		APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+		if (!Pawn)
 		{
-			AActor* A = Pair.Key.Get();
-			if (!A || Pair.Value.Num() == 0)
+			return;
+		}
+		TInlineComponentArray<UInstancedStaticMeshComponent*> Comps(Pawn);
+		for (UInstancedStaticMeshComponent* C : Comps)
+		{
+			if (C->GetStaticMesh() != RailMesh)
 			{
 				continue;
 			}
-			TInlineComponentArray<UStaticMeshComponent*> Comps(A);
-			for (UStaticMeshComponent* C : Comps)
+			bool bHasBroken = false;
+			for (int32 Slot = 0; Slot < C->GetNumMaterials(); ++Slot)
 			{
-				if (Cast<USplineMeshComponent>(C) || C->GetStaticMesh() != RailMesh || !C->IsVisible())
+				bHasBroken |= C->GetMaterial(Slot) == BrokenMaterial;
+			}
+			if (!bHasBroken)
+			{
+				continue;
+			}
+			const bool bHasSpline = C->NumCustomDataFloats >= 27;
+			if (HighlightSwapsLogged < 10)
+			{
+				++HighlightSwapsLogged;
+				FString First;
+				if (C->PerInstanceSMCustomData.Num() >= C->NumCustomDataFloats && C->NumCustomDataFloats > 0)
 				{
-					continue;
+					TArray<float> Inst(C->PerInstanceSMCustomData.GetData(), C->NumCustomDataFloats);
+					First = FirstFloats(Inst, 28);
 				}
-				// The piece whose start is nearest this component.
-				const FVector Loc = C->GetComponentLocation();
-				const FRailSpline* Best = nullptr;
-				double BestDist = TNumericLimits<double>::Max();
-				for (const FRailSpline& RS : Pair.Value)
+				UE_LOG(LogSSBeamRailFix, Display, TEXT("HIGHLIGHTSWAP %s.%s: %d instances, %d custom floats, %s. Instance 0: [%s]"), *Pawn->GetName(), *C->GetName(),
+					C->GetInstanceCount(), C->NumCustomDataFloats, bHasSpline ? TEXT("swapped to bending material") : TEXT("NOT swapped (no spline data)"), *First);
+			}
+			if (!bHasSpline)
+			{
+				continue;
+			}
+			for (int32 Slot = 0; Slot < C->GetNumMaterials(); ++Slot)
+			{
+				if (C->GetMaterial(Slot) == BrokenMaterial)
 				{
-					const double Dist = FVector::DistSquared(Loc, RS.P0);
-					if (Dist < BestDist)
-					{
-						BestDist = Dist;
-						Best = &RS;
-					}
-				}
-				if (!Best)
-				{
-					continue;
-				}
-				const FTransform T = C->GetComponentTransform();
-				USplineMeshComponent* B = NewObject<USplineMeshComponent>(A);
-				B->SetMobility(EComponentMobility::Movable);
-				B->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-				B->SetStaticMesh(RailMesh);
-				B->SetupAttachment(A->GetRootComponent());
-				B->RegisterComponent();
-				B->SetWorldTransform(T);
-				B->SetStartAndEnd(T.InverseTransformPosition(Best->P0), T.InverseTransformVector(Best->T0),
-					T.InverseTransformPosition(Best->P1), T.InverseTransformVector(Best->T1), true);
-				for (int32 Slot = 0; Slot < C->GetNumMaterials(); ++Slot)
-				{
-					B->SetMaterial(Slot, C->GetMaterial(Slot));
-				}
-				C->SetVisibility(false);
-				BuildSwaps.Add({C, B});
-				if (BuildSwapsLogged++ < 6)
-				{
-					UE_LOG(LogSSBeamRailFix, Display, TEXT("HIGHLIGHTSWAP %s.%s -> bent spline mesh (start offset %.0f, mat %s)"), *A->GetName(), *C->GetName(),
-						FMath::Sqrt(BestDist), *GetNameSafe(C->GetMaterial(0)));
+					C->SetMaterial(Slot, HMID);
 				}
 			}
 		}
@@ -301,6 +308,7 @@ namespace
 			return;
 		}
 		bProbeStarted = true;
+		ProbeWorld = World;
 		FTimerHandle FastHandle;
 		World->GetTimerManager().SetTimer(FastHandle, FTimerDelegate::CreateLambda([]() { FixConstruction(); }), 0.05f, true);
 		FTimerHandle Handle;
@@ -432,6 +440,13 @@ namespace
 				Tex ? (int32)Tex->CompressionSettings.GetValue() : -1, Tex ? (Tex->SRGB ? 1 : 0) : -1);
 		}
 		MID->AddToRoot();
+		UMaterialInstanceDynamic* HMID = UMaterialInstanceDynamic::Create(Ours, GetTransientPackage(), TEXT("MID_SSBeamRailFix_Highlight"));
+		for (const FTextureParameterValue& P : SSMaterial->TextureParameterValues)
+		{
+			HMID->SetTextureParameterValue(P.ParameterInfo.Name, P.ParameterValue);
+		}
+		HMID->AddToRoot();
+		HighlightReplacement = HMID;
 		Broken = SSMaterial;
 		Replacement = MID;
 		ApplyConsoleValues();
@@ -443,7 +458,7 @@ namespace
 void FSSBeamRailFixModule::StartupModule()
 {
 #if !WITH_EDITOR
-	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.10 hooks registered."));
+	UE_LOG(LogSSBeamRailFix, Display, TEXT("SSBeamRailFix 0.4.11 hooks registered."));
 
 	SUBSCRIBE_METHOD(AAbstractInstanceManager::SetInstanced,
 		[](auto& Scope, AAbstractInstanceManager*, AActor* Owner, const FTransform&, const FInstanceData& Instance,

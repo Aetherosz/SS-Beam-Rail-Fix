@@ -36,7 +36,7 @@ Credit for the rail model, textures and the railway itself goes to D4rk.
 | `ssrail.RailSat` | `0.3` | Colour saturation of the unpainted steel rail, from `0` to `1`. |
 | `ssrail.ClipRail` | `1` | `1` hides the rail part of `M_SSRail` and shows the game's own track on top, so the steel rail and deck look exactly like vanilla track. `0` shows the mod's own rail instead, for comparison. |
 | `ssrail.PaintGain` | `2` | Brightness of the paint colour. |
-| `ssrail.BendHighlight` | `1` | `1` bends the dismantle highlight along the rail's curve. `0` leaves the game's straight highlight pieces. |
+| `ssrail.BendHighlight` | `1` | `1` draws the dismantle outline with the mod's bending material, so it follows the rail's curve. `0` leaves the game's straight outline. |
 | `ssrail.Finish` | `1` | `1` applies paint finishes (metallic and roughness, for example copper) to the I-beam. `0` ignores them. |
 | `ssrail.Roughness` | `0.6` | Base roughness of the I-beam. The paint finish's roughness is multiplied with it. |
 | `ssrail.PaintDetail` | `0.25` | How much of the texture detail shows through the paint, from `0` (flat colour) to `1`. |
@@ -50,4 +50,4 @@ The repo root is the plugin folder. Put it in an SML starter project under `Mods
 1. **Only if the material changes:** close the Unreal Editor and rebuild it with `Scripts/make_M_SSRail.py`. Run it through the editor's Python commandlet: `UnrealEditor-Cmd.exe <FactoryGame.uproject> -run=pythonscript -script=<path to make_M_SSRail.py>`. It needs the Python Editor Script Plugin. If `M_SSRail` already exists, the script loads it and rebuilds its graph in place, so there's no need to move the old one aside.
 2. Package with Alpakit, or with `RunUAT PackagePlugin -DLCName=SSBeamRailFix`.
 
-`tools/rebuild-0.4.10.ps1` writes the current `.uplugin`, C++ source and material script into the mod folder. By default that's the repo root; use `-mod <path>` to point it elsewhere.
+`tools/rebuild-0.4.11.ps1` writes the current `.uplugin`, C++ source and material script into the mod folder. By default that's the repo root; use `-mod <path>` to point it elsewhere.
