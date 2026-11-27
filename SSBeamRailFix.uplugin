@@ -1,15 +1,15 @@
 ﻿{
 	"FileVersion": 3,
-	"Version": 0,
-	"VersionName": "0.4.11",
-	"SemVersion": "0.4.11",
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"SemVersion": "1.0.0",
 	"GameVersion": ">=520140",
-	"FriendlyName": "SS Beam Rail Fix (private test)",
-	"Description": "Private test build. Redraws Structural Solutions beam railway with its own bending, paintable material, using SS's textures at runtime. Ships none of Structural Solutions' files.",
+	"FriendlyName": "SS Beam Rail Fix",
+	"Description": "Fixes Structural Solutions' Train Rail I-Beam: it bends along curves, takes paint and finishes on the beam, and its steel rail looks like vanilla track. Requires Structural Solutions; ships none of its files.",
 	"Category": "Modding",
 	"CreatedBy": "Aetherosz",
 	"CanContainContent": true,
-	"IsBetaVersion": true,
+	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
 	"Installed": false,
 	"RequiredOnRemote": false,
@@ -29,7 +29,6 @@
 		{
 			"Name": "SS_Mod",
 			"Enabled": true,
-			"Optional": true,
 			"SemVersion": ">=1.1.47"
 		}
 	]
